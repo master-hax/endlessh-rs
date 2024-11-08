@@ -52,6 +52,7 @@ struct ConnectedClient {
 
 // the SSH client will try to parse lines starting with "SSH-", ending the banner
 // the "Alphanumeric" rand distribution never generates '-' so we should be good
+// see https://datatracker.ietf.org/doc/html/rfc4253#section-4.2
 fn rand_line(rng: &mut dyn RngCore, buffer: &mut[u8]) {
     rng
     .sample_iter(Alphanumeric)
