@@ -2,6 +2,8 @@
 
 an implementation of [endlessh](https://nullprogram.com/blog/2019/03/22/) in Rust
 
+inspired by [endlessh](https://github.com/skeeto/endlessh) & [endlessh-go](https://github.com/shizunge/endlessh-go)
+
 ```
 Usage: endlessh-rs [OPTIONS]
 
@@ -18,3 +20,4 @@ Options:
 
 - [ ] add logging
 - [ ] support prometheus metrics
+- [ ] add comparison between implementations
