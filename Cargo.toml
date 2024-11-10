@@ -7,5 +7,5 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4.5.20", features = ["derive"] }
+fastrand = "2.2.0"
 mio = { version = "1.0.2", features = ["os-poll", "net"] }
-rand = "0.8.5"

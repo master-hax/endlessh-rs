@@ -7,13 +7,9 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::process::exit;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
-
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
-
-use rand::RngCore;
-use rand::{Rng,distributions::Alphanumeric};
-
+use fastrand;
 use clap::Parser;
 
 const TCP_SERVER_TOKEN: Token = Token(0);
@@ -51,14 +47,12 @@ struct ConnectedClient {
 }
 
 // the SSH client will try to parse lines starting with "SSH-", ending the banner
-// the "Alphanumeric" rand distribution never generates '-' so we should be good
+// the "alphanumeric" distribution never generates '-' so we should be good
 // see https://datatracker.ietf.org/doc/html/rfc4253#section-4.2
-fn rand_line(rng: &mut dyn RngCore, buffer: &mut[u8]) {
-    rng
-    .sample_iter(Alphanumeric)
-    .take(buffer.len())
-    .enumerate()
-    .for_each(|(index, byte)| buffer[index] = byte);
+fn rand_line(buffer: &mut[u8]) {
+    for element in buffer.iter_mut() {
+        *element = fastrand::alphanumeric() as u8;
+    }
 }
 
 fn try_accept_new_connections(
@@ -123,8 +117,6 @@ fn endlessh(args: &EndlesshArgs) {
     let mut poll = Poll::new().unwrap();
     let mut events = Events::with_capacity(128);
     let mut connected_clients: VecDeque<ConnectedClient> = VecDeque::with_capacity(args.max_clients);
-
-    let mut rng = rand::thread_rng();
     let mut current_timeout = None;
     let mut tcp_accept_available = false;
     
@@ -162,7 +154,7 @@ fn endlessh(args: &EndlesshArgs) {
         }
 
         if !connected_clients.is_empty() {
-            rand_line(&mut rng, &mut line_buffer[..args.banner_line_length]);
+            rand_line(&mut line_buffer[..args.banner_line_length]);
             while let Some(connected_client) = connected_clients.pop_front() {
 
                 let send_or_wait: Option<Duration> = match connected_client.last_send_time {
