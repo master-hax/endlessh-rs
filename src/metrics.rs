@@ -52,7 +52,7 @@ impl MioStreamGiver for UnixListener {
     }
 }
 
-pub trait MioStream: Read + Write + event::Source {}
+trait MioStream: Read + Write + event::Source {}
 impl MioStream for TcpStream {}
 #[cfg(unix)]
 impl MioStream for UnixStream {}

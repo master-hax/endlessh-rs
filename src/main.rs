@@ -17,7 +17,10 @@ use clap::Parser;
 use endlessh::{EndlesshOptions, EndlesshServer};
 
 #[cfg(unix)]
-use mio::net::{UnixListener,UnixStream};
+use {
+    mio::net::{UnixListener,UnixStream},
+    std::fs::remove_file,
+};
 
 #[cfg(feature = "metrics")]
 mod metrics;
