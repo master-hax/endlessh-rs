@@ -2,20 +2,17 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{copy, Cursor, Read, Write};
 use std::io::ErrorKind;
 
-
-use std::time::{Instant,Duration};
-
 use httparse::Request;
 use mio::Poll;
 use mio::{Interest,{event, Token}};
 use mio::net::{TcpListener,TcpStream};
-#[cfg(unix)]
-use mio::net::{UnixListener,UnixStream};
 
 use httparse::Status;
 
+#[cfg(unix)]
+use mio::net::{UnixListener,UnixStream};
+
 const METRIC_HTTP_REQUEST_MAX_SIZE: usize = 8192;
-const METRIC_CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 const HTTP_404_RESPONSE: &str = "HTTP/1.1 404 Not Found\r\n\r\n";
 const HTTP_405_RESPONSE: &str = "HTTP/1.1 405 Method Not Allowed\r\n\r\n";
@@ -29,7 +26,6 @@ enum MetricRequestStatus {
 
 struct HttpClient {
     stream: Box<dyn MioStream>,
-    connected_time: Instant,
     connection_status: MetricRequestStatus,
 }
 
@@ -43,7 +39,6 @@ impl MioStreamGiver for TcpListener {
         Ok(Box::new(stream))
     }
 }
-
 #[cfg(unix)]
 impl MioStreamGiver for UnixListener {
     fn accept_stream(&self) -> std::io::Result<(Box<dyn MioStream>)> {
@@ -56,10 +51,6 @@ trait MioStream: Read + Write + event::Source {}
 impl MioStream for TcpStream {}
 #[cfg(unix)]
 impl MioStream for UnixStream {}
-
-trait RequestHandler {
-    fn handle_request() -> Box<dyn Read>;
-}
 
 fn generate_http_response(
     to_body: &impl ToString,
@@ -153,7 +144,6 @@ impl MetricServer {
                     poll.registry().register(&mut stream, token, Interest::READABLE).expect("failed to poll on metric client stream");
                     let new_client = HttpClient {
                         stream,
-                        connected_time: Instant::now(),
                         connection_status: MetricRequestStatus::ReadingRequest([0_u8; METRIC_HTTP_REQUEST_MAX_SIZE], 0)
                     };
                     println!("accepted new metric connection with token {}", token.0);

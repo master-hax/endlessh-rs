@@ -22,6 +22,7 @@ use {
     std::fs::remove_file,
 };
 
+const SSH_SERVER_TOKEN: Token = Token(0);
 #[cfg(feature = "metrics")]
 mod metrics;
 #[cfg(feature = "metrics")]
@@ -76,7 +77,6 @@ impl std::fmt::Display for MultiListener {
     }
 }
 
-const SSH_SERVER_TOKEN: Token = Token(0);
 
 #[derive(Parser,Clone,Debug)]
 #[command(version, about, long_about = None)]
@@ -105,7 +105,6 @@ fn event_loop(
     mut metric_server: Option<MetricServer>,
 ) {
     let mut timeout = None;
-    let mut loop_time = Instant::now();
     loop {
     
         if let Err(err) = poll.poll(&mut events, timeout) {
@@ -114,7 +113,7 @@ fn event_loop(
             }
             panic!("failed to poll: {}", err);
         }
-        loop_time = Instant::now();
+        let loop_time = Instant::now();
         for event in events.iter() {
             match event.token() {
                 _ if endlessh_server.try_handle_event(event, &loop_time) => {},

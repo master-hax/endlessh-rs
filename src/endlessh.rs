@@ -13,6 +13,7 @@ const SSH_LINE_BUFFER_SIZE: usize = 256;
 
 pub enum NewLine {
     LF,
+    #[allow(dead_code)]
     CRLF,
 }
 
