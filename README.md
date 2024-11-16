@@ -20,6 +20,7 @@ Options:
 
 ## TODO
 
-- [ ] add logging
-- [ ] support prometheus metrics
+- [ ] add logging?
+- [ ] support detailed client metrics
+- [ ] add signals support
 - [ ] add comparison between implementations
