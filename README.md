@@ -4,6 +4,12 @@ an implementation of [endlessh](https://nullprogram.com/blog/2019/03/22/) in Rus
 
 inspired by [endlessh](https://github.com/skeeto/endlessh) & [endlessh-go](https://github.com/shizunge/endlessh-go)
 
+features:
+* works on all platforms supported by [mio](https://github.com/tokio-rs/mio), including Windows
+* completely single threaded
+* minimal allocation
+* optional openmetrics/prometheus http server (in the same thread)
+
 ```
 Usage: endlessh-rs.exe [OPTIONS]
 
