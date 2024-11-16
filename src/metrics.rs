@@ -41,7 +41,7 @@ impl MioStreamGiver for TcpListener {
 }
 #[cfg(unix)]
 impl MioStreamGiver for UnixListener {
-    fn accept_stream(&self) -> std::io::Result<(Box<dyn MioStream>)> {
+    fn accept_stream(&self) -> std::io::Result<Box<dyn MioStream>> {
         let (stream,_addr) = self.accept()?;
         Ok(Box::new(stream))
     }
