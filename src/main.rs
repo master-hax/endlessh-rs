@@ -18,7 +18,7 @@ use endlessh::{EndlesshOptions, EndlesshServer};
 
 #[cfg(unix)]
 use {
-    mio::net::{UnixListener,UnixStream},
+    mio::net::UnixListener,
     std::fs::remove_file,
 };
 

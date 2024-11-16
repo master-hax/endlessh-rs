@@ -43,7 +43,7 @@ impl MioStreamGiver for TcpListener {
 impl MioStreamGiver for UnixListener {
     fn accept_stream(&self) -> std::io::Result<(Box<dyn MioStream>)> {
         let (stream,_addr) = self.accept()?;
-        Ok((Box::new(stream)))
+        Ok(Box::new(stream))
     }
 }
 
@@ -99,7 +99,7 @@ impl MetricServer {
     }
 
     #[cfg(unix)]
-    pub fn new_unix(poll: &Poll, mut listener: UnixListener, listener_token: Token, client_token_range: std::ops::Range<usize>) -> Self {
+    pub fn new_unix(poll: &Poll, listener: UnixListener, listener_token: Token, client_token_range: std::ops::Range<usize>) -> Self {
         MetricServer::create(poll, Box::new(listener), listener_token, client_token_range)
     }
 
