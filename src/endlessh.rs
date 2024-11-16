@@ -59,11 +59,11 @@ impl Default for EndlesshStats {
         Self {
             started_time: now,
             last_known_time: now,
+            trapped_time: Duration::ZERO,
             connections_opened: 0,
             connections_closed: 0,
             bytes_generated: 0,
             bytes_sent: 0,
-            trapped_time: Duration::ZERO,
         }
     }
 }
@@ -73,11 +73,11 @@ impl Display for EndlesshStats {
         write!(f,
             concat!(
                 "endlessh_ssh_uptime_seconds: {}\n",
+                "endlessh_ssh_trapped_time_seconds: {}\n",
                 "endlessh_ssh_connections_opened: {}\n",
                 "endlessh_ssh_connections_closed: {}\n",
                 "endlessh_ssh_bytes_generated: {}\n",
                 "endlessh_ssh_bytes_sent: {}\n",
-                "endlessh_ssh_trapped_time_seconds: {}\n",
             ),
             self.last_known_time.duration_since(self.started_time).as_secs(),
             self.connections_opened,

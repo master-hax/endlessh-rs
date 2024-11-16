@@ -2,14 +2,14 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{copy, Cursor, Read, Write};
 use std::io::ErrorKind;
 
-use std::net::SocketAddr;
+
 use std::time::{Instant,Duration};
-use clap::builder::Str;
+
 use httparse::Request;
 use mio::Poll;
 use mio::{Interest,{event, Token}};
 use mio::net::{TcpListener,TcpStream};
-#[cfg(target_os = "unix")]
+#[cfg(unix)]
 use mio::net::{UnixListener,UnixStream};
 
 use httparse::Status;
@@ -35,26 +35,26 @@ struct HttpClient {
 
 trait MioStreamGiver: event::Source {
     // fn accept_stream(&self) -> std::io::Result<AcceptedMioStream>;
-    fn accept_stream(&self) -> std::io::Result<(Box<dyn MioStream>, SocketAddr)>;
+    fn accept_stream(&self) -> std::io::Result<Box<dyn MioStream>>;
 }
 impl MioStreamGiver for TcpListener {
-    fn accept_stream(&self) -> std::io::Result<(Box<dyn MioStream>, SocketAddr)> {
-        let (stream,addr) = self.accept()?;
-        Ok((Box::new(stream),addr))
+    fn accept_stream(&self) -> std::io::Result<Box<dyn MioStream>> {
+        let (stream,_addr) = self.accept()?;
+        Ok(Box::new(stream))
     }
 }
 
-#[cfg(target_os = "unix")]
+#[cfg(unix)]
 impl MioStreamGiver for UnixListener {
-    fn accept_stream(&self) -> std::io::Result<(Box<dyn MioStream>, SocketAddr)> {
-        let (stream,addr) = self.accept()?;
-        Ok((Box::new(stream),addr))
+    fn accept_stream(&self) -> std::io::Result<(Box<dyn MioStream>)> {
+        let (stream,_addr) = self.accept()?;
+        Ok((Box::new(stream)))
     }
 }
 
 pub trait MioStream: Read + Write + event::Source {}
 impl MioStream for TcpStream {}
-#[cfg(target_os = "unix")]
+#[cfg(unix)]
 impl MioStream for UnixStream {}
 
 trait RequestHandler {
@@ -107,10 +107,9 @@ impl MetricServer {
         MetricServer::create(poll, Box::new(listener), listener_token, client_token_range)
     }
 
-    #[cfg(target_os = "unix")]
+    #[cfg(unix)]
     pub fn new_unix(poll: &Poll, mut listener: UnixListener, listener_token: Token, client_token_range: std::ops::Range<usize>) -> Self {
-        poll.registry().register(&mut listener, listener_token, Interest::READABLE).unwrap();
-        MetricServer::create(Box::new(listener), listener_token, client_token_range)
+        MetricServer::create(poll, Box::new(listener), listener_token, client_token_range)
     }
 
     pub fn try_handle_event(&mut self, event: &event::Event, poll: &mut Poll, response: &impl ToString) -> bool {
@@ -146,7 +145,7 @@ impl MetricServer {
             // due to https://github.com/rust-lang/rust/issues/53667
 
             match self.listener.accept_stream() {
-                Ok((mut stream, _address)) => {
+                Ok(mut stream) => {
                     
                     let token = self.available_connections.pop_front().expect("available connections is empty");
                     println!("accepting a new stream with token: {}", token.0);
@@ -214,21 +213,21 @@ impl MetricServer {
             // http request has completed
 
             match request_parser.path {
-                Some("/metrics") => {},
+                Some("/metrics") => {
+                    match request_parser.method {
+                        Some("GET") => {
+                            let response = generate_http_response(http_response_body);
+                            client.connection_status = MetricRequestStatus::WritingResponse(Box::new(Cursor::new(response)));
+                        },
+                        _ => {
+                            client.connection_status = MetricRequestStatus::WritingResponse(Box::new(Cursor::new(HTTP_405_RESPONSE)));
+                        },
+                    }
+                },
                 _ => {
                     client.connection_status = MetricRequestStatus::WritingResponse(Box::new(Cursor::new(HTTP_404_RESPONSE)));
-                    return Some(client)
                 },
             }
-            match request_parser.method {
-                Some("GET") => {},
-                _ => {
-                    client.connection_status = MetricRequestStatus::WritingResponse(Box::new(Cursor::new(HTTP_405_RESPONSE)));
-                    return Some(client)
-                },
-            }
-            let response = generate_http_response(http_response_body);
-            client.connection_status = MetricRequestStatus::WritingResponse(Box::new(Cursor::new(response)));
             poll.registry().reregister(&mut client.stream, *token, Interest::WRITABLE).unwrap();
             Some(client)
         },

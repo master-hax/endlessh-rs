@@ -7,12 +7,17 @@ mod endlessh;
 
 use std::io::ErrorKind::Interrupted;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::path::PathBuf;
+
 use std::time::{Duration, Instant};
 use mio::net::TcpListener;
 use mio::{Events, Poll, Token};
 use clap::Parser;
 
 use endlessh::{EndlesshOptions, EndlesshServer};
+
+#[cfg(unix)]
+use mio::net::{UnixListener,UnixStream};
 
 #[cfg(feature = "metrics")]
 mod metrics;
@@ -27,7 +32,7 @@ const METRIC_CLIENT_TOKEN_START: usize = 2;
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum MultiListener {
     Ip(SocketAddr),
-    Unix(String),
+    Unix(PathBuf),
     Disabled,
 }
 
@@ -43,7 +48,7 @@ impl From<&str> for MultiListener {
                 Err(e) => panic!("bad ip address - {}", e),
             }
         } else if v.starts_with("unix:") {
-            MultiListener::Unix(v[5..].to_owned())
+            MultiListener::Unix(PathBuf::from(&v[5..]))
         } else {
             panic!("listener must be of the form \"disabled|ip:<socketaddr>|unix:<socketpath>\"")
         }
@@ -55,11 +60,11 @@ impl std::fmt::Display for MultiListener {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         match &self {
             &MultiListener::Ip(i) => {
-                 write!(f, "ip:{}", i)
+                write!(f, "ip:{}", i)
             },
             &MultiListener::Unix(p) => { 
-                write!(f, "unix:{}", p)
-             },
+                write!(f, "unix:{}", p.display())
+            },
             &MultiListener::Disabled => {
                 write!(f, "disabled")
             },
@@ -121,7 +126,7 @@ fn event_loop(
         timeout = endlessh_server.handle_wakeup(&loop_time);
     }
 }
-
+ 
 
 fn main() {
     let args = &Args::parse();
@@ -152,13 +157,14 @@ fn main() {
             println!("endlessh-rs listening for metrics connections on {}", args.metrics_listen_address);
             Some(MetricServer::new_tcp(&poll, tcp_listener, METRIC_SERVER_TOKEN, METRIC_CLIENT_TOKEN_START..METRIC_CLIENT_TOKEN_START+args.metrics_max_clients))
         },
-        #[cfg(target_os = "unix")]
+        #[cfg(unix)]
         MultiListener::Unix(path) => {
-            let unix_listener = UnixListener::bind(*path).expect("failed to bind to unix socket");
+            let _ = remove_file(path);
+            let unix_listener = UnixListener::bind(path).expect("failed to bind to unix socket");
             println!("endlessh-rs listening for metrics connections on {}", args.metrics_listen_address);
             Some(MetricServer::new_unix(&poll, unix_listener, METRIC_SERVER_TOKEN, METRIC_CLIENT_TOKEN_START..METRIC_CLIENT_TOKEN_START+args.metrics_max_clients))
         },
-        #[cfg(not(target_os = "unix"))]
+        #[cfg(not(unix))]
         MultiListener::Unix(_) => {
             panic!("unix sockets are not supported on this platform")
         },
