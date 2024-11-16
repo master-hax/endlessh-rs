@@ -1,9 +1,12 @@
 [package]
 name = "endlessh-rs"
 version = "0.1.0"
+authors = [ "Vivek Revankar <vivek@master-hax.com>" ]
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description   = "ssh client trap"
+readme = "README.md"
+repository = "https://github.com/master-hax/endlessh-rs.git"
+publish = false
 
 [dependencies]
 clap = { version = "4.5.20", features = ["derive"] }
