@@ -8,6 +8,9 @@ use std::collections::VecDeque;
 use std::fmt::Formatter;
 use std::io::{ErrorKind, Write};
 
+#[cfg(feature = "metrics")]
+pub mod metrics;
+
 const SSH_LINE_BUFFER_SIZE: usize = 256;
 
 pub enum NewLine {
@@ -140,6 +143,7 @@ impl EndlesshServer {
         }
     }
 
+    /// Returns `true` if the event was handled, otherwise `false`.
     pub fn try_handle_event(&mut self, event: &event::Event, now: &Instant) -> bool {
         assert!(*now >= self.stats.last_known_time, "time went backwards!");
         self.stats.last_known_time = *now;

@@ -3,8 +3,6 @@
  * an implementation of endlessh in rust
  */
 
-mod endlessh;
-
 use std::io::ErrorKind::Interrupted;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
@@ -14,16 +12,14 @@ use mio::net::TcpListener;
 use mio::{Events, Poll, Token};
 use std::time::{Duration, Instant};
 
-use endlessh::{EndlesshOptions, EndlesshServer};
+use endlessh::{EndlesshOptions, EndlesshServer, NewLine};
 
 #[cfg(unix)]
 use {mio::net::UnixListener, std::fs::remove_file};
 
 const SSH_SERVER_TOKEN: Token = Token(0);
 #[cfg(feature = "metrics")]
-mod metrics;
-#[cfg(feature = "metrics")]
-use metrics::MetricServer;
+use endlessh::metrics::MetricServer;
 #[cfg(feature = "metrics")]
 const METRIC_SERVER_TOKEN: Token = Token(1);
 #[cfg(feature = "metrics")]
@@ -137,7 +133,7 @@ fn main() {
             banner_line_length: args.ssh_banner_line_length,
             max_clients: args.ssh_max_clients,
             message_delay: Duration::from_millis(args.ssh_message_delay_ms),
-            newline: endlessh::NewLine::LF,
+            newline: NewLine::LF,
         },
         ssh_listener,
         SSH_SERVER_TOKEN,
