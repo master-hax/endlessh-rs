@@ -1,13 +1,12 @@
-
 use std::fmt::Display;
-use std::time::{Instant,Duration};
+use std::time::{Duration, Instant};
 
-use std::collections::VecDeque;
-use mio::net::{TcpListener,TcpStream};
+use mio::net::{TcpListener, TcpStream};
+use mio::{event, Interest};
 use mio::{Poll, Token};
-use mio::{Interest,event};
-use std::io::{ErrorKind, Write};
+use std::collections::VecDeque;
 use std::fmt::Formatter;
+use std::io::{ErrorKind, Write};
 
 const SSH_LINE_BUFFER_SIZE: usize = 256;
 
@@ -20,8 +19,8 @@ pub enum NewLine {
 impl NewLine {
     fn get_data(&self) -> &[u8] {
         match self {
-            NewLine::LF => &[ '\n' as u8 ],
-            NewLine::CRLF => &[ '\r' as u8, '\n' as u8 ],
+            NewLine::LF => &['\n' as u8],
+            NewLine::CRLF => &['\r' as u8, '\n' as u8],
         }
     }
 }
@@ -71,7 +70,8 @@ impl Default for EndlesshStats {
 
 impl Display for EndlesshStats {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
-        write!(f,
+        write!(
+            f,
             concat!(
                 "endlessh_ssh_uptime_seconds: {}\n",
                 "endlessh_ssh_trapped_time_seconds: {}\n",
@@ -80,7 +80,9 @@ impl Display for EndlesshStats {
                 "endlessh_ssh_bytes_generated: {}\n",
                 "endlessh_ssh_bytes_sent: {}\n",
             ),
-            self.last_known_time.duration_since(self.started_time).as_secs(),
+            self.last_known_time
+                .duration_since(self.started_time)
+                .as_secs(),
             self.connections_opened,
             self.connections_closed,
             self.bytes_generated,
@@ -108,14 +110,24 @@ struct EndlesshClient {
 }
 
 impl EndlesshServer {
-
-    pub fn create(options: EndlesshOptions, mut listener: TcpListener, listener_token: Token, poll: &Poll) -> Self {
+    pub fn create(
+        options: EndlesshOptions,
+        mut listener: TcpListener,
+        listener_token: Token,
+        poll: &Poll,
+    ) -> Self {
         let mut line_buffer = [0_u8; SSH_LINE_BUFFER_SIZE];
-        assert!(options.banner_line_length + options.newline.get_data().len() <= SSH_LINE_BUFFER_SIZE);
-        line_buffer[options.banner_line_length..options.banner_line_length+options.newline.get_data().len()].copy_from_slice(&options.newline.get_data());
+        assert!(
+            options.banner_line_length + options.newline.get_data().len() <= SSH_LINE_BUFFER_SIZE
+        );
+        line_buffer[options.banner_line_length
+            ..options.banner_line_length + options.newline.get_data().len()]
+            .copy_from_slice(&options.newline.get_data());
         let clients = VecDeque::with_capacity(options.max_clients);
 
-        poll.registry().register(&mut listener, listener_token, Interest::READABLE).unwrap();
+        poll.registry()
+            .register(&mut listener, listener_token, Interest::READABLE)
+            .unwrap();
 
         EndlesshServer {
             listener,
@@ -137,7 +149,7 @@ impl EndlesshServer {
             true
         } else {
             false
-        }
+        };
     }
 
     pub fn handle_wakeup(&mut self, now: &Instant) -> Option<Duration> {
@@ -145,16 +157,15 @@ impl EndlesshServer {
         self.stats.last_known_time = *now;
         let mut generated_line = false;
         while let Some(client) = self.clients.pop_front() {
-
             let send_or_wait: Option<Duration> = match client.last_send_time {
                 None => {
                     // client has never received a line - send immediately
                     None
-                },
+                }
                 Some(last_send) => {
-                    // client has received a line before - send if the message window has elapsed 
+                    // client has received a line before - send if the message window has elapsed
                     (last_send + self.options.message_delay).checked_duration_since(*now)
-                },
+                }
             };
 
             match send_or_wait {
@@ -169,15 +180,14 @@ impl EndlesshServer {
                         None => {
                             // drop the client
                             self.accept_new_connections(now);
-                        },
+                        }
                     }
-                },
+                }
                 Some(need_to_wait) => {
                     self.clients.push_back(client);
                     return Some(need_to_wait);
                 }
             }
-
         }
         None
     }
@@ -196,7 +206,7 @@ impl EndlesshServer {
                         last_send_time: None,
                     });
                     self.stats.connections_opened += 1;
-                },
+                }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
                     self.listener_accept_available = false;
                 }
@@ -210,35 +220,38 @@ impl EndlesshServer {
     // the SSH client will try to parse lines starting with "SSH-", ending the banner
     // the "alphanumeric" distribution never generates '-' so should not be a problem
     // see https://datatracker.ietf.org/doc/html/rfc4253#section-4.2 for more
-    fn rand_line(buffer: &mut[u8]) {
+    fn rand_line(buffer: &mut [u8]) {
         for element in buffer.iter_mut() {
             *element = fastrand::alphanumeric() as u8;
         }
     }
 
     fn send_line(&mut self, mut client: EndlesshClient, now: &Instant) -> Option<EndlesshClient> {
-        match client.stream.write(&self.line_buffer[..self.options.banner_line_length + self.options.newline.get_data().len()]) {
+        match client.stream.write(
+            &self.line_buffer
+                [..self.options.banner_line_length + self.options.newline.get_data().len()],
+        ) {
             Ok(0) => {
                 // client disconnected, goodbye 👋
                 None
-            },
+            }
             Ok(n) => {
                 // send (at least partially) succeeded
                 self.stats.bytes_sent += n;
-                self.stats.trapped_time += now.duration_since(client.last_send_time.unwrap_or(client.connected_time));
-                
+                self.stats.trapped_time +=
+                    now.duration_since(client.last_send_time.unwrap_or(client.connected_time));
+
                 client.last_send_time = Some(*now);
                 Some(client)
-            },
+            }
             Err(ref err) if err.kind() == ErrorKind::WouldBlock => {
                 // couldn't send - oh well
                 Some(client)
-            },
+            }
             Err(_e) => {
                 // 🤷 goodbye 👋
                 None
-            },
+            }
         }
     }
-
 }
