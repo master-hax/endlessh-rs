@@ -3,7 +3,6 @@ use std::io::ErrorKind;
 use std::io::{copy, Cursor, Read};
 
 use httparse::Request;
-use mio::net::TcpListener;
 use mio::Poll;
 use mio::{
     Interest, {event, Token},
@@ -11,10 +10,7 @@ use mio::{
 
 use httparse::Status;
 
-#[cfg(unix)]
-use mio::net::UnixListener;
-
-use crate::listener::{MioStream, MioStreamGiver};
+use crate::listener::{MioStream, MioListener};
 
 const METRIC_HTTP_REQUEST_MAX_SIZE: usize = 8192;
 
@@ -28,8 +24,8 @@ enum MetricRequestStatus {
     WritingResponse(Box<dyn Read>),
 }
 
-struct HttpClient {
-    stream: Box<dyn MioStream>,
+struct HttpClient<Stream: MioStream> {
+    stream: Stream,
     connection_status: MetricRequestStatus,
 }
 
@@ -46,18 +42,19 @@ fn generate_http_response(to_body: &impl ToString) -> String {
     )
 }
 
-pub struct MetricServer {
-    listener: Box<dyn MioStreamGiver>,
+pub struct MetricServer<Listener: MioListener> {
+    listener: Listener,
     listener_token: Token,
     listener_accept_available: bool,
     available_connections: VecDeque<Token>,
-    current_connections: HashMap<Token, HttpClient>,
+    current_connections: HashMap<Token, HttpClient<Listener::Stream>>,
 }
 
-impl MetricServer {
-    fn create(
+impl<Listener: MioListener> MetricServer<Listener> {
+    /// Creates a [`MetricServer`] that serves metrics requests on `listener`.
+    pub fn new(
         poll: &Poll,
-        mut listener: Box<dyn MioStreamGiver>,
+        mut listener: Listener,
         listener_token: Token,
         client_token_range: std::ops::Range<usize>,
     ) -> Self {
@@ -74,25 +71,6 @@ impl MetricServer {
             available_connections,
             current_connections: HashMap::with_capacity(num_available),
         }
-    }
-
-    pub fn new_tcp(
-        poll: &Poll,
-        listener: TcpListener,
-        listener_token: Token,
-        client_token_range: std::ops::Range<usize>,
-    ) -> Self {
-        MetricServer::create(poll, Box::new(listener), listener_token, client_token_range)
-    }
-
-    #[cfg(unix)]
-    pub fn new_unix(
-        poll: &Poll,
-        listener: UnixListener,
-        listener_token: Token,
-        client_token_range: std::ops::Range<usize>,
-    ) -> Self {
-        MetricServer::create(poll, Box::new(listener), listener_token, client_token_range)
     }
 
     pub fn try_handle_event(
@@ -162,9 +140,9 @@ impl MetricServer {
         &self,
         poll: &mut Poll,
         token: &Token,
-        mut client: HttpClient,
+        mut client: HttpClient<Listener::Stream>,
         http_response_body: &impl ToString,
-    ) -> Option<HttpClient> {
+    ) -> Option<HttpClient<Listener::Stream>> {
         match client.connection_status {
             MetricRequestStatus::ReadingRequest(mut buffer, mut current_position) => {
                 let cursor = &mut Cursor::new(&mut buffer[current_position..]);

@@ -1,9 +1,6 @@
 use std::fmt::Display;
 use std::time::{Duration, Instant};
 
-use mio::net::TcpListener;
-#[cfg(unix)]
-use mio::net::UnixListener;
 use mio::{event, Interest};
 use mio::{Poll, Token};
 use std::collections::VecDeque;
@@ -11,7 +8,7 @@ use std::fmt::Formatter;
 use std::io::{ErrorKind, Write};
 
 mod listener;
-use listener::{MioStream, MioStreamGiver};
+pub use listener::{MioStream, MioListener};
 
 #[cfg(feature = "metrics")]
 pub mod metrics;
@@ -101,26 +98,27 @@ impl Display for EndlesshStats {
     }
 }
 
-pub struct EndlesshServer {
-    listener: Box<dyn MioStreamGiver>,
+pub struct EndlesshServer<Listener: MioListener> {
+    listener: Listener,
     listener_token: Token,
     listener_accept_available: bool,
     line_buffer: [u8; SSH_LINE_BUFFER_SIZE],
-    clients: VecDeque<EndlesshClient>,
+    clients: VecDeque<EndlesshClient<Listener::Stream>>,
     stats: EndlesshStats,
     options: EndlesshOptions,
 }
 
-struct EndlesshClient {
-    stream: Box<dyn MioStream>,
+struct EndlesshClient<Stream: MioStream> {
+    stream: Stream,
     connected_time: Instant,
     last_send_time: Option<Instant>,
 }
 
-impl EndlesshServer {
-    fn create(
+impl<Listener: MioListener> EndlesshServer<Listener> {
+    /// Creates an [`EndlesshServer`] that accepts ssh connections on `listener`.
+    pub fn new(
         options: EndlesshOptions,
-        mut listener: Box<dyn MioStreamGiver>,
+        mut listener: Listener,
         listener_token: Token,
         poll: &Poll,
     ) -> Self {
@@ -146,27 +144,6 @@ impl EndlesshServer {
             stats: EndlesshStats::default(),
             options,
         }
-    }
-
-    /// Creates an [`EndlesshServer`] that accepts ssh connections over TCP.
-    pub fn new_tcp(
-        options: EndlesshOptions,
-        listener: TcpListener,
-        listener_token: Token,
-        poll: &Poll,
-    ) -> Self {
-        Self::create(options, Box::new(listener), listener_token, poll)
-    }
-
-    /// Creates an [`EndlesshServer`] that accepts ssh connections over a unix domain socket.
-    #[cfg(unix)]
-    pub fn new_unix(
-        options: EndlesshOptions,
-        listener: UnixListener,
-        listener_token: Token,
-        poll: &Poll,
-    ) -> Self {
-        Self::create(options, Box::new(listener), listener_token, poll)
     }
 
     /// Returns `true` if the event was handled, otherwise `false`.
@@ -209,6 +186,7 @@ impl EndlesshServer {
                         Some(c) => self.clients.push_back(c),
                         None => {
                             // drop the client
+                            self.stats.connections_closed += 1;
                             self.accept_new_connections(now);
                         }
                     }
@@ -256,7 +234,11 @@ impl EndlesshServer {
         }
     }
 
-    fn send_line(&mut self, mut client: EndlesshClient, now: &Instant) -> Option<EndlesshClient> {
+    fn send_line(
+        &mut self,
+        mut client: EndlesshClient<Listener::Stream>,
+        now: &Instant,
+    ) -> Option<EndlesshClient<Listener::Stream>> {
         match client.stream.write(
             &self.line_buffer
                 [..self.options.banner_line_length + self.options.newline.get_data().len()],
