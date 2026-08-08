@@ -117,9 +117,14 @@ impl<Listener: MioListener> MetricServer<Listener> {
                         .pop_front()
                         .expect("available connections is empty");
 
-                    poll.registry()
-                        .register(&mut stream, token, Interest::READABLE)
-                        .expect("failed to poll on metric client stream");
+                    if let Err(e) =
+                        poll.registry()
+                            .register(&mut stream, token, Interest::READABLE)
+                    {
+                        eprintln!("failed to register metrics client: {}", e);
+                        self.available_connections.push_back(token);
+                        continue;
+                    }
                     let new_client = HttpClient {
                         stream,
                         connection_status: MetricRequestStatus::ReadingRequest(
@@ -134,10 +139,42 @@ impl<Listener: MioListener> MetricServer<Listener> {
                     self.listener_accept_available = false;
                 }
                 Err(e) => {
-                    panic!("failed to accept connection: {}", e);
+                    // don't crash on a transient accept() failure - break instead of
+                    // clearing listener_accept_available in case readiness is edge-triggered
+                    eprintln!("failed to accept metrics connection: {}", e);
+                    break;
                 }
             }
         }
+    }
+
+    /// deregisters `client` and drops it, logging (rather than panicking) if deregistration fails.
+    fn close(
+        poll: &mut Poll,
+        mut client: HttpClient<Listener::Stream>,
+    ) -> Option<HttpClient<Listener::Stream>> {
+        if let Err(e) = poll.registry().deregister(&mut client.stream) {
+            eprintln!("failed to deregister metrics client: {}", e);
+        }
+        None
+    }
+
+    /// reregisters `client` for writing and queues `response`, closing it instead on failure.
+    fn respond(
+        poll: &mut Poll,
+        token: &Token,
+        mut client: HttpClient<Listener::Stream>,
+        response: Box<dyn Read>,
+    ) -> Option<HttpClient<Listener::Stream>> {
+        if let Err(e) =
+            poll.registry()
+                .reregister(&mut client.stream, *token, Interest::WRITABLE)
+        {
+            eprintln!("failed to reregister metrics client: {}", e);
+            return Self::close(poll, client);
+        }
+        client.connection_status = MetricRequestStatus::WritingResponse(response);
+        Some(client)
     }
 
     fn handle_client(
@@ -147,93 +184,52 @@ impl<Listener: MioListener> MetricServer<Listener> {
         mut client: HttpClient<Listener::Stream>,
         http_response_body: &impl ToString,
     ) -> Option<HttpClient<Listener::Stream>> {
-        match client.connection_status {
-            MetricRequestStatus::ReadingRequest(mut buffer, mut current_position) => {
+        match &mut client.connection_status {
+            MetricRequestStatus::ReadingRequest(buffer, current_position) => {
                 // bounded read - can't overflow `buffer`, unlike `std::io::copy`
-                match client.stream.read(&mut buffer[current_position..]) {
-                    Ok(0) => {
-                        poll.registry().deregister(&mut client.stream).unwrap();
-                        return None;
-                    }
+                match client.stream.read(&mut buffer[*current_position..]) {
+                    Ok(0) => return Self::close(poll, client),
                     Ok(n) => {
-                        current_position += n;
+                        *current_position += n;
                     }
                     Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-                    Err(_e) => {
-                        poll.registry().deregister(&mut client.stream).unwrap();
-                        return None;
-                    }
+                    Err(_e) => return Self::close(poll, client),
                 };
+                let request_too_big = *current_position >= buffer.len();
                 let mut headers = [httparse::EMPTY_HEADER; METRIC_HTTP_MAX_HEADERS];
                 let mut request_parser = Request::new(&mut headers);
-                match request_parser.parse(&buffer[..current_position]) {
-                    Ok(Status::Complete(_)) => {}
+                let response: Box<dyn Read> = match request_parser.parse(&buffer[..*current_position])
+                {
                     // request too big for our buffer, or has too many header fields
-                    Ok(Status::Partial) if current_position >= buffer.len() => {
-                        poll.registry()
-                            .reregister(&mut client.stream, *token, Interest::WRITABLE)
-                            .unwrap();
-                        client.connection_status = MetricRequestStatus::WritingResponse(Box::new(
-                            Cursor::new(HTTP_431_RESPONSE),
-                        ));
-                        return Some(client);
+                    Ok(Status::Partial) if request_too_big => {
+                        Box::new(Cursor::new(HTTP_431_RESPONSE))
                     }
                     Err(httparse::Error::TooManyHeaders) => {
-                        poll.registry()
-                            .reregister(&mut client.stream, *token, Interest::WRITABLE)
-                            .unwrap();
-                        client.connection_status = MetricRequestStatus::WritingResponse(Box::new(
-                            Cursor::new(HTTP_431_RESPONSE),
-                        ));
-                        return Some(client);
+                        Box::new(Cursor::new(HTTP_431_RESPONSE))
                     }
-                    Ok(Status::Partial) => {
-                        client.connection_status =
-                            MetricRequestStatus::ReadingRequest(buffer, current_position);
-                        return Some(client);
-                    }
-                    Err(_e) => {
-                        poll.registry().deregister(&mut client.stream).unwrap();
-                        return None;
-                    }
-                };
-
-                // http request has completed
-
-                match request_parser.path {
-                    Some("/metrics") => match request_parser.method {
-                        Some("GET") => {
-                            let response = generate_http_response(http_response_body);
-                            client.connection_status = MetricRequestStatus::WritingResponse(
-                                Box::new(Cursor::new(response)),
-                            );
-                        }
-                        _ => {
-                            client.connection_status = MetricRequestStatus::WritingResponse(
-                                Box::new(Cursor::new(HTTP_405_RESPONSE)),
-                            );
-                        }
+                    Ok(Status::Partial) => return Some(client),
+                    Err(_e) => return Self::close(poll, client),
+                    // http request has completed
+                    Ok(Status::Complete(_)) => match request_parser.path {
+                        Some("/metrics") => match request_parser.method {
+                            Some("GET") => {
+                                Box::new(Cursor::new(generate_http_response(http_response_body)))
+                            }
+                            _ => Box::new(Cursor::new(HTTP_405_RESPONSE)),
+                        },
+                        _ => Box::new(Cursor::new(HTTP_404_RESPONSE)),
                     },
-                    _ => {
-                        client.connection_status = MetricRequestStatus::WritingResponse(Box::new(
-                            Cursor::new(HTTP_404_RESPONSE),
-                        ));
-                    }
-                }
-                poll.registry()
-                    .reregister(&mut client.stream, *token, Interest::WRITABLE)
-                    .unwrap();
-                Some(client)
+                };
+                Self::respond(poll, token, client, response)
             }
-            MetricRequestStatus::WritingResponse(mut to_write) => {
-                match copy(&mut to_write, &mut client.stream) {
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                        client.connection_status = MetricRequestStatus::WritingResponse(to_write);
-                        return Some(client);
-                    }
+            MetricRequestStatus::WritingResponse(to_write) => {
+                match copy(to_write, &mut client.stream) {
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => return Some(client),
                     _ => {}
                 };
-                poll.registry().deregister(&mut client.stream).unwrap();
+                if let Err(e) = poll.registry().deregister(&mut client.stream) {
+                    eprintln!("failed to deregister metrics client: {}", e);
+                }
                 None
             }
         }
