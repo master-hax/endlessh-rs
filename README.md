@@ -8,20 +8,29 @@ features:
 * works on all platforms supported by [mio](https://github.com/tokio-rs/mio), including Windows
 * completely single threaded
 * minimal allocation
+* listens on either TCP or unix sockets
 * optional openmetrics/prometheus http server (in the same thread)
 
 ```
 Usage: endlessh-rs.exe [OPTIONS]
 
 Options:
-      --ssh-listen-address <SSH_LISTEN_ADDRESS>          [default: 0.0.0.0:2222]
-      --ssh-banner-line-length <SSH_BANNER_LINE_LENGTH>  [default: 32]
-      --ssh-max-clients <SSH_MAX_CLIENTS>                [default: 4096]
-      --ssh-message-delay-ms <SSH_MESSAGE_DELAY_MS>      [default: 10000]
-      --metrics-listen-address <METRICS_LISTEN_ADDRESS>  [default: disabled]
-      --metrics-max-clients <METRICS_MAX_CLIENTS>        [default: 3]
-  -h, --help                                             Print help
-  -V, --version                                          Print version
+      --ssh-listen-address <SSH_LISTEN_ADDRESS>
+          address to accept ssh connections on, in the form "ip:<socketaddr>" or "unix:<socketpath>" [default: ip:0.0.0.0:2222]
+      --ssh-banner-line-length <SSH_BANNER_LINE_LENGTH>
+          length, in bytes, of each randomly generated banner line sent to ssh clients [default: 32]
+      --ssh-max-clients <SSH_MAX_CLIENTS>
+          maximum number of ssh clients to trap at once [default: 4096]
+      --ssh-message-delay-ms <SSH_MESSAGE_DELAY_MS>
+          delay, in milliseconds, between banner lines sent to each trapped ssh client [default: 10000]
+      --metrics-listen-address <METRICS_LISTEN_ADDRESS>
+          address to serve openmetrics/prometheus stats on, in the form "disabled", "ip:<socketaddr>", or "unix:<socketpath>" [default: disabled]
+      --metrics-max-clients <METRICS_MAX_CLIENTS>
+          maximum number of concurrent metrics http clients to serve at once [default: 3]
+  -h, --help
+          Print help
+  -V, --version
+          Print version
 ```
 
 ## TODO
