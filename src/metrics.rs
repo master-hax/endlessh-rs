@@ -14,8 +14,8 @@ use crate::listener::{MioListener, MioStream};
 
 const METRIC_HTTP_REQUEST_MAX_SIZE: usize = 8192;
 
-const HTTP_404_RESPONSE: &str = "HTTP/1.1 404 Not Found\r\n\r\n";
-const HTTP_405_RESPONSE: &str = "HTTP/1.1 405 Method Not Allowed\r\n\r\n";
+const HTTP_404_RESPONSE: &str = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
+const HTTP_405_RESPONSE: &str = "HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n";
 
 type HttpRequestBuffer = [u8; METRIC_HTTP_REQUEST_MAX_SIZE];
 
@@ -35,6 +35,7 @@ fn generate_http_response(to_body: &impl ToString) -> String {
         concat!(
             "HTTP/1.1 200 OK\r\n",
             "Content-Type: application/openmetrics-text; version=1.0.0; charset=utf-8\r\n",
+            "Connection: close\r\n",
             "Content-Length: {}\r\n\r\n{}",
         ),
         body.len(),
