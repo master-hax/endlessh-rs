@@ -91,11 +91,11 @@ impl Display for EndlesshStats {
             self.last_known_time
                 .duration_since(self.started_time)
                 .as_secs(),
+            self.trapped_time.as_secs(),
             self.connections_opened,
             self.connections_closed,
             self.bytes_generated,
             self.bytes_sent,
-            self.trapped_time.as_secs(),
         )?;
         Ok(())
     }

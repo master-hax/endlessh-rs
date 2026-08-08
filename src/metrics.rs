@@ -102,24 +102,19 @@ impl MetricServer {
         response: &impl ToString,
     ) -> bool {
         return if self.listener_token == event.token() {
-            println!("metric server token");
             self.listener_accept_available = true;
             self.try_accept_new_connections(poll);
             true
         } else if let Some((client_token, client)) =
             self.current_connections.remove_entry(&event.token())
         {
-            println!("metric client token");
             if let Some(client) = self.handle_client(poll, &client_token, client, response) {
                 assert!(self
                     .current_connections
                     .insert(client_token, client)
                     .is_none());
             } else {
-                println!("available conn1: {:?}", self.available_connections);
-                println!("killing client: {}", client_token.0);
                 self.available_connections.push_back(client_token);
-                println!("available conn: {:?}", self.available_connections);
             }
             // in case the number of clients dropped from the max
             self.try_accept_new_connections(poll);
@@ -131,9 +126,6 @@ impl MetricServer {
 
     fn try_accept_new_connections(&mut self, poll: &mut Poll) {
         while self.listener_accept_available && !self.available_connections.is_empty() {
-            println!("doing an accept");
-            println!("available tokens: {:?}", self.available_connections);
-
             // due to https://github.com/rust-lang/rust/issues/53667
 
             match self.listener.accept_stream() {
@@ -142,7 +134,6 @@ impl MetricServer {
                         .available_connections
                         .pop_front()
                         .expect("available connections is empty");
-                    println!("accepting a new stream with token: {}", token.0);
 
                     poll.registry()
                         .register(&mut stream, token, Interest::READABLE)
@@ -154,7 +145,6 @@ impl MetricServer {
                             0,
                         ),
                     };
-                    println!("accepted new metric connection with token {}", token.0);
 
                     self.current_connections.insert(token, new_client);
                 }
@@ -180,20 +170,16 @@ impl MetricServer {
                 let cursor = &mut Cursor::new(&mut buffer[current_position..]);
                 match copy(&mut client.stream, cursor) {
                     Ok(0) => {
-                        println!("copied no bytes to cursor");
                         poll.registry().deregister(&mut client.stream).unwrap();
                         return None;
                     }
-                    Ok(n) => {
-                        println!("read {} bytes to buffer", n);
+                    Ok(_n) => {
                         current_position += cursor.position() as usize;
                     }
                     Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                        println!("metric read would block");
                         current_position += cursor.position() as usize;
                     }
-                    Err(e) => {
-                        println!("cursor copy error: {}", e);
+                    Err(_e) => {
                         poll.registry().deregister(&mut client.stream).unwrap();
                         return None;
                     }
@@ -206,8 +192,7 @@ impl MetricServer {
                             MetricRequestStatus::ReadingRequest(buffer, current_position);
                         return Some(client);
                     }
-                    Err(e) => {
-                        println!("bad http request from metric client: {}", e);
+                    Err(_e) => {
                         poll.registry().deregister(&mut client.stream).unwrap();
                         return None;
                     }
@@ -242,20 +227,11 @@ impl MetricServer {
             }
             MetricRequestStatus::WritingResponse(mut to_write) => {
                 match copy(&mut to_write, &mut client.stream) {
-                    Ok(0) => {
-                        println!("wrote no bytes to client");
-                    }
-                    Ok(n) => {
-                        println!("wrote {} bytes to client", n);
-                    }
                     Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                        println!("metric write would block");
                         client.connection_status = MetricRequestStatus::WritingResponse(to_write);
                         return Some(client);
                     }
-                    Err(e) => {
-                        println!("cursor copy error: {}", e);
-                    }
+                    _ => {}
                 };
                 poll.registry().deregister(&mut client.stream).unwrap();
                 None
