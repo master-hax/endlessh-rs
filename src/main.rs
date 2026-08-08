@@ -174,13 +174,22 @@ fn event_loop<SshListener: MioListener>(
 /// (TCP vs unix) is also chosen at runtime, so each transport needs its own call site
 /// for the compiler to monomorphize `MetricServer<MetricsListener>` against.
 #[cfg(feature = "metrics")]
-fn run<Listener: MioListener>(poll: Poll, events: Events, endlessh_server: EndlesshServer<Listener>, args: &Args) {
+fn run<Listener: MioListener>(
+    poll: Poll,
+    events: Events,
+    endlessh_server: EndlesshServer<Listener>,
+    args: &Args,
+) {
     match &args.metrics_listen_address {
-        MultiListener::Disabled => {
-            event_loop(poll, events, endlessh_server, None::<MetricServer<TcpListener>>)
-        }
+        MultiListener::Disabled => event_loop(
+            poll,
+            events,
+            endlessh_server,
+            None::<MetricServer<TcpListener>>,
+        ),
         MultiListener::Ip(ip) => {
-            let tcp_listener = TcpListener::bind(*ip).expect("failed to bind to metrics TCP socket");
+            let tcp_listener =
+                TcpListener::bind(*ip).expect("failed to bind to metrics TCP socket");
             println!(
                 "endlessh-rs listening for metrics connections on {}",
                 args.metrics_listen_address

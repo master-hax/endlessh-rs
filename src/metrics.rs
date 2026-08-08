@@ -10,7 +10,7 @@ use mio::{
 
 use httparse::Status;
 
-use crate::listener::{MioStream, MioListener};
+use crate::listener::{MioListener, MioStream};
 
 const METRIC_HTTP_REQUEST_MAX_SIZE: usize = 8192;
 

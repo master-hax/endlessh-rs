@@ -8,7 +8,7 @@ use std::fmt::Formatter;
 use std::io::{ErrorKind, Write};
 
 mod listener;
-pub use listener::{MioStream, MioListener};
+pub use listener::{MioListener, MioStream};
 
 #[cfg(feature = "metrics")]
 pub mod metrics;
@@ -103,12 +103,12 @@ pub struct EndlesshServer<Listener: MioListener> {
     listener_token: Token,
     listener_accept_available: bool,
     line_buffer: [u8; SSH_LINE_BUFFER_SIZE],
-    clients: VecDeque<EndlesshClient<Listener::Stream>>,
+    connections: VecDeque<EndlesshConnection<Listener::Stream>>,
     stats: EndlesshStats,
     options: EndlesshOptions,
 }
 
-struct EndlesshClient<Stream: MioStream> {
+struct EndlesshConnection<Stream: MioStream> {
     stream: Stream,
     connected_time: Instant,
     last_send_time: Option<Instant>,
@@ -129,7 +129,7 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
         line_buffer[options.banner_line_length
             ..options.banner_line_length + options.newline.get_data().len()]
             .copy_from_slice(&options.newline.get_data());
-        let clients = VecDeque::with_capacity(options.max_clients);
+        let connections = VecDeque::with_capacity(options.max_clients);
 
         poll.registry()
             .register(&mut listener, listener_token, Interest::READABLE)
@@ -140,7 +140,7 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
             listener_token,
             listener_accept_available: false,
             line_buffer,
-            clients,
+            connections,
             stats: EndlesshStats::default(),
             options,
         }
@@ -163,14 +163,14 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
         assert!(*now >= self.stats.last_known_time, "time went backwards!");
         self.stats.last_known_time = *now;
         let mut generated_line = false;
-        while let Some(client) = self.clients.pop_front() {
-            let send_or_wait: Option<Duration> = match client.last_send_time {
+        while let Some(connection) = self.connections.pop_front() {
+            let send_or_wait: Option<Duration> = match connection.last_send_time {
                 None => {
-                    // client has never received a line - send immediately
+                    // connection has never received a line - send immediately
                     None
                 }
                 Some(last_send) => {
-                    // client has received a line before - send if the message window has elapsed
+                    // connection has received a line before - send if the message window has elapsed
                     (last_send + self.options.message_delay).checked_duration_since(*now)
                 }
             };
@@ -182,17 +182,17 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
                         self.stats.bytes_generated += self.options.banner_line_length;
                         generated_line = true;
                     }
-                    match self.send_line(client, now) {
-                        Some(c) => self.clients.push_back(c),
+                    match self.send_line(connection, now) {
+                        Some(c) => self.connections.push_back(c),
                         None => {
-                            // drop the client
+                            // drop the connection
                             self.stats.connections_closed += 1;
                             self.accept_new_connections(now);
                         }
                     }
                 }
                 Some(need_to_wait) => {
-                    self.clients.push_back(client);
+                    self.connections.push_back(connection);
                     return Some(need_to_wait);
                 }
             }
@@ -205,10 +205,10 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
     }
 
     fn accept_new_connections(&mut self, now: &Instant) {
-        while self.listener_accept_available && self.clients.len() < self.options.max_clients {
+        while self.listener_accept_available && self.connections.len() < self.options.max_clients {
             match self.listener.accept_stream() {
                 Ok(stream) => {
-                    self.clients.push_back(EndlesshClient {
+                    self.connections.push_back(EndlesshConnection {
                         stream,
                         connected_time: *now,
                         last_send_time: None,
@@ -236,29 +236,32 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
 
     fn send_line(
         &mut self,
-        mut client: EndlesshClient<Listener::Stream>,
+        mut connection: EndlesshConnection<Listener::Stream>,
         now: &Instant,
-    ) -> Option<EndlesshClient<Listener::Stream>> {
-        match client.stream.write(
+    ) -> Option<EndlesshConnection<Listener::Stream>> {
+        match connection.stream.write(
             &self.line_buffer
                 [..self.options.banner_line_length + self.options.newline.get_data().len()],
         ) {
             Ok(0) => {
-                // client disconnected, goodbye 👋
+                // connection closed, goodbye 👋
                 None
             }
             Ok(n) => {
                 // send (at least partially) succeeded
                 self.stats.bytes_sent += n;
-                self.stats.trapped_time +=
-                    now.duration_since(client.last_send_time.unwrap_or(client.connected_time));
+                self.stats.trapped_time += now.duration_since(
+                    connection
+                        .last_send_time
+                        .unwrap_or(connection.connected_time),
+                );
 
-                client.last_send_time = Some(*now);
-                Some(client)
+                connection.last_send_time = Some(*now);
+                Some(connection)
             }
             Err(ref err) if err.kind() == ErrorKind::WouldBlock => {
                 // couldn't send - oh well
-                Some(client)
+                Some(connection)
             }
             Err(_e) => {
                 // 🤷 goodbye 👋
