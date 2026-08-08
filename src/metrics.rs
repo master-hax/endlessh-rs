@@ -13,9 +13,12 @@ use httparse::Status;
 use crate::listener::{MioListener, MioStream};
 
 const METRIC_HTTP_REQUEST_MAX_SIZE: usize = 8192;
+const METRIC_HTTP_MAX_HEADERS: usize = 32;
 
 const HTTP_404_RESPONSE: &str = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
 const HTTP_405_RESPONSE: &str = "HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n";
+const HTTP_431_RESPONSE: &str =
+    "HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\n\r\n";
 
 type HttpRequestBuffer = [u8; METRIC_HTTP_REQUEST_MAX_SIZE];
 
@@ -146,26 +149,44 @@ impl<Listener: MioListener> MetricServer<Listener> {
     ) -> Option<HttpClient<Listener::Stream>> {
         match client.connection_status {
             MetricRequestStatus::ReadingRequest(mut buffer, mut current_position) => {
-                let cursor = &mut Cursor::new(&mut buffer[current_position..]);
-                match copy(&mut client.stream, cursor) {
+                // bounded read - can't overflow `buffer`, unlike `std::io::copy`
+                match client.stream.read(&mut buffer[current_position..]) {
                     Ok(0) => {
                         poll.registry().deregister(&mut client.stream).unwrap();
                         return None;
                     }
-                    Ok(_n) => {
-                        current_position += cursor.position() as usize;
+                    Ok(n) => {
+                        current_position += n;
                     }
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                        current_position += cursor.position() as usize;
-                    }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {}
                     Err(_e) => {
                         poll.registry().deregister(&mut client.stream).unwrap();
                         return None;
                     }
                 };
-                let mut request_parser = Request::new(&mut []);
+                let mut headers = [httparse::EMPTY_HEADER; METRIC_HTTP_MAX_HEADERS];
+                let mut request_parser = Request::new(&mut headers);
                 match request_parser.parse(&buffer[..current_position]) {
-                    Ok(Status::Complete(_)) | Err(httparse::Error::TooManyHeaders) => {}
+                    Ok(Status::Complete(_)) => {}
+                    // request too big for our buffer, or has too many header fields
+                    Ok(Status::Partial) if current_position >= buffer.len() => {
+                        poll.registry()
+                            .reregister(&mut client.stream, *token, Interest::WRITABLE)
+                            .unwrap();
+                        client.connection_status = MetricRequestStatus::WritingResponse(Box::new(
+                            Cursor::new(HTTP_431_RESPONSE),
+                        ));
+                        return Some(client);
+                    }
+                    Err(httparse::Error::TooManyHeaders) => {
+                        poll.registry()
+                            .reregister(&mut client.stream, *token, Interest::WRITABLE)
+                            .unwrap();
+                        client.connection_status = MetricRequestStatus::WritingResponse(Box::new(
+                            Cursor::new(HTTP_431_RESPONSE),
+                        ));
+                        return Some(client);
+                    }
                     Ok(Status::Partial) => {
                         client.connection_status =
                             MetricRequestStatus::ReadingRequest(buffer, current_position);
