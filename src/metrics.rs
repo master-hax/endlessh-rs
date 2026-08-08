@@ -1,9 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
-use std::io::{copy, Cursor, Read, Write};
+use std::io::{copy, Cursor, Read};
 
 use httparse::Request;
-use mio::net::{TcpListener, TcpStream};
+use mio::net::TcpListener;
 use mio::Poll;
 use mio::{
     Interest, {event, Token},
@@ -12,7 +12,9 @@ use mio::{
 use httparse::Status;
 
 #[cfg(unix)]
-use mio::net::{UnixListener, UnixStream};
+use mio::net::UnixListener;
+
+use crate::listener::{MioStream, MioStreamGiver};
 
 const METRIC_HTTP_REQUEST_MAX_SIZE: usize = 8192;
 
@@ -30,29 +32,6 @@ struct HttpClient {
     stream: Box<dyn MioStream>,
     connection_status: MetricRequestStatus,
 }
-
-trait MioStreamGiver: event::Source {
-    // fn accept_stream(&self) -> std::io::Result<AcceptedMioStream>;
-    fn accept_stream(&self) -> std::io::Result<Box<dyn MioStream>>;
-}
-impl MioStreamGiver for TcpListener {
-    fn accept_stream(&self) -> std::io::Result<Box<dyn MioStream>> {
-        let (stream, _addr) = self.accept()?;
-        Ok(Box::new(stream))
-    }
-}
-#[cfg(unix)]
-impl MioStreamGiver for UnixListener {
-    fn accept_stream(&self) -> std::io::Result<Box<dyn MioStream>> {
-        let (stream, _addr) = self.accept()?;
-        Ok(Box::new(stream))
-    }
-}
-
-trait MioStream: Read + Write + event::Source {}
-impl MioStream for TcpStream {}
-#[cfg(unix)]
-impl MioStream for UnixStream {}
 
 fn generate_http_response(to_body: &impl ToString) -> String {
     let body = to_body.to_string();

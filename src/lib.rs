@@ -1,12 +1,17 @@
 use std::fmt::Display;
 use std::time::{Duration, Instant};
 
-use mio::net::{TcpListener, TcpStream};
+use mio::net::TcpListener;
+#[cfg(unix)]
+use mio::net::UnixListener;
 use mio::{event, Interest};
 use mio::{Poll, Token};
 use std::collections::VecDeque;
 use std::fmt::Formatter;
 use std::io::{ErrorKind, Write};
+
+mod listener;
+use listener::{MioStream, MioStreamGiver};
 
 #[cfg(feature = "metrics")]
 pub mod metrics;
@@ -97,7 +102,7 @@ impl Display for EndlesshStats {
 }
 
 pub struct EndlesshServer {
-    listener: TcpListener,
+    listener: Box<dyn MioStreamGiver>,
     listener_token: Token,
     listener_accept_available: bool,
     line_buffer: [u8; SSH_LINE_BUFFER_SIZE],
@@ -107,15 +112,15 @@ pub struct EndlesshServer {
 }
 
 struct EndlesshClient {
-    stream: TcpStream,
+    stream: Box<dyn MioStream>,
     connected_time: Instant,
     last_send_time: Option<Instant>,
 }
 
 impl EndlesshServer {
-    pub fn create(
+    fn create(
         options: EndlesshOptions,
-        mut listener: TcpListener,
+        mut listener: Box<dyn MioStreamGiver>,
         listener_token: Token,
         poll: &Poll,
     ) -> Self {
@@ -141,6 +146,27 @@ impl EndlesshServer {
             stats: EndlesshStats::default(),
             options,
         }
+    }
+
+    /// Creates an [`EndlesshServer`] that accepts ssh connections over TCP.
+    pub fn new_tcp(
+        options: EndlesshOptions,
+        listener: TcpListener,
+        listener_token: Token,
+        poll: &Poll,
+    ) -> Self {
+        Self::create(options, Box::new(listener), listener_token, poll)
+    }
+
+    /// Creates an [`EndlesshServer`] that accepts ssh connections over a unix domain socket.
+    #[cfg(unix)]
+    pub fn new_unix(
+        options: EndlesshOptions,
+        listener: UnixListener,
+        listener_token: Token,
+        poll: &Poll,
+    ) -> Self {
+        Self::create(options, Box::new(listener), listener_token, poll)
     }
 
     /// Returns `true` if the event was handled, otherwise `false`.
@@ -202,8 +228,8 @@ impl EndlesshServer {
 
     fn accept_new_connections(&mut self, now: &Instant) {
         while self.listener_accept_available && self.clients.len() < self.options.max_clients {
-            match self.listener.accept() {
-                Ok((stream, _address)) => {
+            match self.listener.accept_stream() {
+                Ok(stream) => {
                     self.clients.push_back(EndlesshClient {
                         stream,
                         connected_time: *now,

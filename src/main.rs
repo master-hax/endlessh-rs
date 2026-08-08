@@ -25,7 +25,6 @@ const METRIC_SERVER_TOKEN: Token = Token(1);
 #[cfg(feature = "metrics")]
 const METRIC_CLIENT_TOKEN_START: usize = 2;
 
-#[cfg(feature = "metrics")]
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum MultiListener {
     Ip(SocketAddr),
@@ -33,7 +32,6 @@ enum MultiListener {
     Disabled,
 }
 
-#[cfg(feature = "metrics")]
 impl From<&str> for MultiListener {
     fn from(v: &str) -> MultiListener {
         if v == "disabled" {
@@ -52,7 +50,6 @@ impl From<&str> for MultiListener {
     }
 }
 
-#[cfg(feature = "metrics")]
 impl std::fmt::Display for MultiListener {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         match &self {
@@ -73,19 +70,43 @@ impl std::fmt::Display for MultiListener {
 #[derive(Parser, Clone, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    #[arg(long, default_value_t=SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 2222)))]
-    ssh_listen_address: SocketAddr,
-    #[arg(long, default_value_t = 32)]
+    #[arg(
+        long,
+        default_value_t=MultiListener::Ip(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 2222))),
+        help = "address to accept ssh connections on, in the form \"ip:<socketaddr>\" or \"unix:<socketpath>\""
+    )]
+    ssh_listen_address: MultiListener,
+    #[arg(
+        long,
+        default_value_t = 32,
+        help = "length, in bytes, of each randomly generated banner line sent to ssh clients"
+    )]
     ssh_banner_line_length: usize,
-    #[arg(long, default_value_t = 4096)]
+    #[arg(
+        long,
+        default_value_t = 4096,
+        help = "maximum number of ssh clients to trap at once"
+    )]
     ssh_max_clients: usize,
-    #[arg(long, default_value_t = 10_000)]
+    #[arg(
+        long,
+        default_value_t = 10_000,
+        help = "delay, in milliseconds, between banner lines sent to each trapped ssh client"
+    )]
     ssh_message_delay_ms: u64,
     #[cfg(feature = "metrics")]
-    #[arg(long, default_value_t=MultiListener::Disabled)]
+    #[arg(
+        long,
+        default_value_t = MultiListener::Disabled,
+        help = "address to serve openmetrics/prometheus stats on, in the form \"disabled\", \"ip:<socketaddr>\", or \"unix:<socketpath>\""
+    )]
     metrics_listen_address: MultiListener,
     #[cfg(feature = "metrics")]
-    #[arg(long, default_value_t = 3)]
+    #[arg(
+        long,
+        default_value_t = 3,
+        help = "maximum number of concurrent metrics http clients to serve at once"
+    )]
     metrics_max_clients: usize,
 }
 
@@ -125,23 +146,36 @@ fn main() {
     let poll = Poll::new().unwrap();
     let events = Events::with_capacity(128);
 
-    let ssh_listener: TcpListener =
-        TcpListener::bind(args.ssh_listen_address).expect("failed to bind to ssh socket");
+    let ssh_options = EndlesshOptions {
+        banner_line_length: args.ssh_banner_line_length,
+        max_clients: args.ssh_max_clients,
+        message_delay: Duration::from_millis(args.ssh_message_delay_ms),
+        newline: NewLine::LF,
+    };
 
-    let endlessh_server = EndlesshServer::create(
-        EndlesshOptions {
-            banner_line_length: args.ssh_banner_line_length,
-            max_clients: args.ssh_max_clients,
-            message_delay: Duration::from_millis(args.ssh_message_delay_ms),
-            newline: NewLine::LF,
-        },
-        ssh_listener,
-        SSH_SERVER_TOKEN,
-        &poll,
-    );
+    let endlessh_server = match &args.ssh_listen_address {
+        MultiListener::Ip(ip) => {
+            let tcp_listener = TcpListener::bind(*ip).expect("failed to bind to ssh TCP socket");
+            EndlesshServer::new_tcp(ssh_options, tcp_listener, SSH_SERVER_TOKEN, &poll)
+        }
+        #[cfg(unix)]
+        MultiListener::Unix(path) => {
+            let _ = remove_file(path);
+            let unix_listener =
+                UnixListener::bind(path).expect("failed to bind to ssh unix socket");
+            EndlesshServer::new_unix(ssh_options, unix_listener, SSH_SERVER_TOKEN, &poll)
+        }
+        #[cfg(not(unix))]
+        MultiListener::Unix(_) => {
+            panic!("unix sockets are not supported on this platform")
+        }
+        MultiListener::Disabled => {
+            panic!("ssh listener cannot be disabled")
+        }
+    };
 
     println!(
-        "endlessh-rs listening for ssh connections on ip:{}",
+        "endlessh-rs listening for ssh connections on {}",
         args.ssh_listen_address
     );
 
