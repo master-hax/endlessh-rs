@@ -32,10 +32,29 @@ impl MioListener for UnixListener {
     }
 }
 
-pub trait MioStream: Read + Write + event::Source {}
-impl MioStream for TcpStream {}
+pub trait MioStream: Read + Write + event::Source {
+    fn shrink_receive_buffer(&self) {}
+}
+
 #[cfg(unix)]
-impl MioStream for UnixStream {}
+fn set_recv_buffer_floor(socket: &impl std::os::fd::AsFd) {
+    if let Err(e) = socket2::SockRef::from(socket).set_recv_buffer_size(1) {
+        eprintln!("failed to shrink receive buffer: {}", e);
+    }
+}
+
+impl MioStream for TcpStream {
+    #[cfg(unix)]
+    fn shrink_receive_buffer(&self) {
+        set_recv_buffer_floor(self);
+    }
+}
+#[cfg(unix)]
+impl MioStream for UnixStream {
+    fn shrink_receive_buffer(&self) {
+        set_recv_buffer_floor(self);
+    }
+}
 
 pub enum AnyListener {
     Tcp(TcpListener),
@@ -153,4 +172,12 @@ impl event::Source for AnyStream {
     }
 }
 
-impl MioStream for AnyStream {}
+impl MioStream for AnyStream {
+    #[cfg(unix)]
+    fn shrink_receive_buffer(&self) {
+        match self {
+            AnyStream::Tcp(s) => s.shrink_receive_buffer(),
+            AnyStream::Unix(s) => s.shrink_receive_buffer(),
+        }
+    }
+}

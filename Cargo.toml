@@ -28,3 +28,4 @@ metrics = [ "httparse" ]
 
 [target."cfg(unix)".dependencies]
 mio-signals = "0.3.0"
+socket2 = "0.6.5"

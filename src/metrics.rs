@@ -344,12 +344,10 @@ mod tests {
         };
         let token = Token(2);
 
-        // first poll: partial write then WouldBlock - connection must stay open to retry
         let client = server
             .handle_client(&mut poll, &token, client, &"unused")
             .expect("connection should remain open to retry after WouldBlock");
 
-        // second poll: must finish sending the REST of the body, not skip past it
         let client = server.handle_client(&mut poll, &token, client, &"unused");
         assert!(
             client.is_none(),

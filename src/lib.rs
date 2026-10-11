@@ -208,6 +208,7 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
         while self.listener_accept_available && self.connections.len() < self.options.max_clients {
             match self.listener.accept_stream() {
                 Ok(stream) => {
+                    stream.shrink_receive_buffer();
                     self.connections.push_back(EndlesshConnection {
                         stream,
                         connected_time: *now,
