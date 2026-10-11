@@ -25,3 +25,6 @@ httparse = { version = "1.9.5", optional = true }
 [features]
 default = [ "metrics" ]
 metrics = [ "httparse" ]
+
+[target."cfg(unix)".dependencies]
+mio-signals = "0.3.0"
