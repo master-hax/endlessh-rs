@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt::Display;
 use std::time::{Duration, Instant};
 
@@ -27,6 +28,29 @@ impl NewLine {
             NewLine::LF => &['\n' as u8],
             NewLine::CRLF => &['\r' as u8, '\n' as u8],
         }
+    }
+}
+
+#[derive(Debug)]
+pub enum EndlesshFatalError {
+    InvalidOptions(Cow<'static, str>),
+    Io(std::io::Error),
+}
+
+impl Display for EndlesshFatalError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EndlesshFatalError::InvalidOptions(msg) => write!(f, "{msg}"),
+            EndlesshFatalError::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for EndlesshFatalError {}
+
+impl From<std::io::Error> for EndlesshFatalError {
+    fn from(e: std::io::Error) -> Self {
+        EndlesshFatalError::Io(e)
     }
 }
 
@@ -121,21 +145,23 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
         mut listener: Listener,
         listener_token: Token,
         poll: &Poll,
-    ) -> Self {
+    ) -> Result<Self, EndlesshFatalError> {
+        let newline_len = options.newline.get_data().len();
+        if options.banner_line_length + newline_len > SSH_LINE_BUFFER_SIZE {
+            return Err(EndlesshFatalError::InvalidOptions(Cow::Owned(format!(
+                "banner_line_length must be at most {}",
+                SSH_LINE_BUFFER_SIZE - newline_len
+            ))));
+        }
         let mut line_buffer = [0_u8; SSH_LINE_BUFFER_SIZE];
-        assert!(
-            options.banner_line_length + options.newline.get_data().len() <= SSH_LINE_BUFFER_SIZE
-        );
-        line_buffer[options.banner_line_length
-            ..options.banner_line_length + options.newline.get_data().len()]
+        line_buffer[options.banner_line_length..options.banner_line_length + newline_len]
             .copy_from_slice(&options.newline.get_data());
         let connections = VecDeque::with_capacity(options.max_clients);
 
         poll.registry()
-            .register(&mut listener, listener_token, Interest::READABLE)
-            .unwrap();
+            .register(&mut listener, listener_token, Interest::READABLE)?;
 
-        EndlesshServer {
+        Ok(EndlesshServer {
             listener,
             listener_token,
             listener_accept_available: false,
@@ -143,7 +169,7 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
             connections,
             stats: EndlesshStats::default(),
             options,
-        }
+        })
     }
 
     /// Returns `true` if the event was handled, otherwise `false`.

@@ -62,20 +62,19 @@ impl<Listener: MioListener> MetricServer<Listener> {
         mut listener: Listener,
         listener_token: Token,
         client_token_range: std::ops::Range<usize>,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         poll.registry()
-            .register(&mut listener, listener_token, Interest::READABLE)
-            .unwrap();
+            .register(&mut listener, listener_token, Interest::READABLE)?;
         let available_connections: VecDeque<Token> =
             client_token_range.into_iter().map(|t| Token(t)).collect();
         let num_available = available_connections.len();
-        MetricServer {
+        Ok(MetricServer {
             listener,
             listener_token,
             listener_accept_available: false,
             available_connections,
             current_connections: HashMap::with_capacity(num_available),
-        }
+        })
     }
 
     pub fn try_handle_event(
@@ -326,7 +325,7 @@ mod tests {
         }
 
         let mut poll = Poll::new().unwrap();
-        let server = MetricServer::new(&poll, MockListener, Token(0), 1..2);
+        let server = MetricServer::new(&poll, MockListener, Token(0), 1..2).unwrap();
 
         let body = "hello world, this is the full metrics response body".to_string();
         let written = Rc::new(RefCell::new(Vec::new()));

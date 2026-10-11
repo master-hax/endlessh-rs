@@ -3,6 +3,7 @@
  * an implementation of endlessh in rust
  */
 
+use std::borrow::Cow;
 use std::io::ErrorKind::Interrupted;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
@@ -12,7 +13,7 @@ use mio::net::TcpListener;
 use mio::{event, Events, Interest, Poll, Token};
 use std::time::{Duration, Instant};
 
-use endlessh::{AnyListener, EndlesshOptions, EndlesshServer, NewLine};
+use endlessh::{AnyListener, EndlesshFatalError, EndlesshOptions, EndlesshServer, NewLine};
 
 #[cfg(unix)]
 use endlessh::EndlesshStats;
@@ -33,20 +34,19 @@ enum ListenerAddress {
     Disabled,
 }
 
-impl From<&str> for ListenerAddress {
-    fn from(v: &str) -> ListenerAddress {
+impl std::str::FromStr for ListenerAddress {
+    type Err = String;
+    fn from_str(v: &str) -> Result<ListenerAddress, String> {
         if v == "disabled" {
-            ListenerAddress::Disabled
-        } else if v.starts_with("ip:") {
-            let to_parse: &str = &v[3..];
-            match to_parse.parse::<SocketAddr>() {
-                Ok(s) => ListenerAddress::Ip(s),
-                Err(e) => panic!("bad ip address - {}", e),
-            }
-        } else if v.starts_with("unix:") {
-            ListenerAddress::Unix(PathBuf::from(&v[5..]))
+            Ok(ListenerAddress::Disabled)
+        } else if let Some(addr) = v.strip_prefix("ip:") {
+            addr.parse::<SocketAddr>()
+                .map(ListenerAddress::Ip)
+                .map_err(|e| format!("bad ip address - {}", e))
+        } else if let Some(path) = v.strip_prefix("unix:") {
+            Ok(ListenerAddress::Unix(PathBuf::from(path)))
         } else {
-            panic!("listener must be of the form \"disabled|ip:<socketaddr>|unix:<socketpath>\"")
+            Err("listener must be of the form \"disabled|ip:<socketaddr>|unix:<socketpath>\"".to_string())
         }
     }
 }
@@ -68,27 +68,31 @@ impl std::fmt::Display for ListenerAddress {
     }
 }
 
+fn bind_error(purpose: &str, e: std::io::Error) -> EndlesshFatalError {
+    std::io::Error::new(e.kind(), format!("failed to bind {purpose} socket: {e}")).into()
+}
+
 impl ListenerAddress {
-    fn bind(&self, purpose: &str) -> Option<AnyListener> {
+    fn bind(&self, purpose: &str) -> Result<Option<AnyListener>, EndlesshFatalError> {
         let listener = match self {
-            ListenerAddress::Disabled => return None,
-            ListenerAddress::Ip(ip) => AnyListener::from(
-                TcpListener::bind(*ip)
-                    .unwrap_or_else(|e| panic!("failed to bind {purpose} socket: {e}")),
-            ),
+            ListenerAddress::Disabled => return Ok(None),
+            ListenerAddress::Ip(ip) => {
+                AnyListener::from(TcpListener::bind(*ip).map_err(|e| bind_error(purpose, e))?)
+            }
             #[cfg(unix)]
             ListenerAddress::Unix(path) => {
                 let _ = remove_file(path);
-                AnyListener::from(
-                    UnixListener::bind(path)
-                        .unwrap_or_else(|e| panic!("failed to bind {purpose} socket: {e}")),
-                )
+                AnyListener::from(UnixListener::bind(path).map_err(|e| bind_error(purpose, e))?)
             }
             #[cfg(not(unix))]
-            ListenerAddress::Unix(_) => panic!("unix sockets are not supported on this platform"),
+            ListenerAddress::Unix(_) => {
+                return Err(EndlesshFatalError::InvalidOptions(Cow::Borrowed(
+                    "unix sockets are not supported on this platform",
+                )))
+            }
         };
         println!("endlessh-rs listening for {purpose} connections on {self}");
-        Some(listener)
+        Ok(Some(listener))
     }
 }
 
@@ -144,17 +148,15 @@ struct SignalHandler {
 
 #[cfg(unix)]
 impl SignalHandler {
-    fn new(poll: &Poll, token: Token) -> Self {
-        let mut signals = Signals::new(Signal::Terminate | Signal::Interrupt | Signal::User1)
-            .expect("failed to create signal handler");
+    fn new(poll: &Poll, token: Token) -> Result<Self, EndlesshFatalError> {
+        let mut signals = Signals::new(Signal::Terminate | Signal::Interrupt | Signal::User1)?;
         poll.registry()
-            .register(&mut signals, token, Interest::READABLE)
-            .expect("failed to register signal handler");
-        SignalHandler {
+            .register(&mut signals, token, Interest::READABLE)?;
+        Ok(SignalHandler {
             token,
             signals,
             should_terminate: false,
-        }
+        })
     }
 
     fn should_terminate(&self) -> bool {
@@ -233,16 +235,15 @@ fn event_loop(
     }
 }
 
-fn main() {
-    let args = &Args::parse();
-    let poll = Poll::new().unwrap();
+fn run(args: &Args) -> Result<(), EndlesshFatalError> {
+    let poll = Poll::new()?;
     let events = Events::with_capacity(128);
 
     let mut token_counter = 0usize;
     let ssh_server_token = next_token(&mut token_counter);
 
     #[cfg(unix)]
-    let signal_handler = SignalHandler::new(&poll, next_token(&mut token_counter));
+    let signal_handler = SignalHandler::new(&poll, next_token(&mut token_counter))?;
 
     #[cfg(feature = "metrics")]
     let metric_server_token = next_token(&mut token_counter);
@@ -256,21 +257,24 @@ fn main() {
         newline: NewLine::LF,
     };
 
-    let ssh_listener = args
-        .ssh_listen_address
-        .bind("ssh")
-        .expect("ssh listener cannot be disabled");
-    let endlessh_server = EndlesshServer::new(ssh_options, ssh_listener, ssh_server_token, &poll);
+    let ssh_listener = args.ssh_listen_address.bind("ssh")?.ok_or_else(|| {
+        EndlesshFatalError::InvalidOptions(Cow::Borrowed("ssh listener cannot be disabled"))
+    })?;
+    let endlessh_server = EndlesshServer::new(ssh_options, ssh_listener, ssh_server_token, &poll)?;
 
     #[cfg(feature = "metrics")]
-    let metric_server = args.metrics_listen_address.bind("metrics").map(|listener| {
-        MetricServer::new(
-            &poll,
-            listener,
-            metric_server_token,
-            metric_client_token_start..metric_client_token_start + args.metrics_max_clients,
-        )
-    });
+    let metric_server = args
+        .metrics_listen_address
+        .bind("metrics")?
+        .map(|listener| {
+            MetricServer::new(
+                &poll,
+                listener,
+                metric_server_token,
+                metric_client_token_start..metric_client_token_start + args.metrics_max_clients,
+            )
+        })
+        .transpose()?;
 
     event_loop(
         poll,
@@ -281,4 +285,13 @@ fn main() {
         #[cfg(unix)]
         signal_handler,
     );
+    Ok(())
+}
+
+fn main() {
+    let args = &Args::parse();
+    if let Err(e) = run(args) {
+        eprintln!("endlessh-rs: {}", e);
+        std::process::exit(1);
+    }
 }
