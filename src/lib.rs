@@ -78,7 +78,7 @@ impl Display for EndlesshStats {
         write!(
             f,
             concat!(
-                "endlessh_ssh_uptime_seconds: {}\n",
+                "endlessh_uptime_seconds: {}\n",
                 "endlessh_ssh_trapped_time_seconds: {}\n",
                 "endlessh_ssh_connections_opened: {}\n",
                 "endlessh_ssh_connections_closed: {}\n",
