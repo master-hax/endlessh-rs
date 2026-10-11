@@ -13,7 +13,7 @@ use mio::net::TcpListener;
 use mio::{event, Events, Interest, Poll, Token};
 use std::time::{Duration, Instant};
 
-use endlessh::{AnyListener, EndlesshFatalError, EndlesshOptions, EndlesshServer, NewLine};
+use endlessh::{AnyListener, EndlesshFatalError, EndlesshOptions, EndlesshServer, NewLine, Verbosity};
 
 #[cfg(unix)]
 use endlessh::EndlesshStats;
@@ -91,7 +91,7 @@ impl ListenerAddress {
                 )))
             }
         };
-        println!("endlessh-rs listening for {purpose} connections on {self}");
+        eprintln!("endlessh-rs listening for {purpose} connections on {self}");
         Ok(Some(listener))
     }
 }
@@ -137,6 +137,13 @@ struct Args {
         help = "maximum number of concurrent metrics http clients to serve at once"
     )]
     metrics_max_clients: usize,
+    #[arg(
+        short,
+        long,
+        action = clap::ArgAction::Count,
+        help = "increase logging verbosity (-v logs each connection, -vv for debug)"
+    )]
+    verbose: u8,
 }
 
 #[cfg(unix)]
@@ -170,16 +177,16 @@ impl SignalHandler {
         loop {
             match self.signals.receive() {
                 Ok(Some(Signal::Terminate)) => {
-                    println!("endlessh-rs: received SIGTERM, shutting down\n{}", stats);
+                    eprintln!("endlessh-rs: received SIGTERM, shutting down\n{}", stats);
                     self.should_terminate = true;
                     return true;
                 }
                 Ok(Some(Signal::Interrupt)) => {
-                    println!("endlessh-rs: received SIGINT, shutting down\n{}", stats);
+                    eprintln!("endlessh-rs: received SIGINT, shutting down\n{}", stats);
                     self.should_terminate = true;
                     return true;
                 }
-                Ok(Some(Signal::User1)) => println!("{}", stats),
+                Ok(Some(Signal::User1)) => eprintln!("{}", stats),
                 Ok(Some(_)) => {}
                 Ok(None) => return true,
                 Err(e) => {
@@ -260,7 +267,13 @@ fn run(args: &Args) -> Result<(), EndlesshFatalError> {
     let ssh_listener = args.ssh_listen_address.bind("ssh")?.ok_or_else(|| {
         EndlesshFatalError::InvalidOptions(Cow::Borrowed("ssh listener cannot be disabled"))
     })?;
-    let endlessh_server = EndlesshServer::new(ssh_options, ssh_listener, ssh_server_token, &poll)?;
+    let endlessh_server = EndlesshServer::new(
+        ssh_options,
+        ssh_listener,
+        ssh_server_token,
+        &poll,
+        Verbosity::from(args.verbose),
+    )?;
 
     #[cfg(feature = "metrics")]
     let metric_server = args

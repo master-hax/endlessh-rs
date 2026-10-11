@@ -3,6 +3,7 @@
  */
 
 use std::io::{Read, Result, Write};
+use std::net::{IpAddr, SocketAddr};
 
 use mio::event;
 use mio::net::{TcpListener, TcpStream};
@@ -32,8 +33,32 @@ impl MioListener for UnixListener {
     }
 }
 
+#[derive(Clone, Copy)]
+pub enum HostDescription {
+    Unix,
+    Ip(IpAddr),
+    Unknown,
+}
+
+impl std::fmt::Display for HostDescription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HostDescription::Unix => write!(f, "unix"),
+            HostDescription::Ip(ip) => write!(f, "{ip}"),
+            HostDescription::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
 pub trait MioStream: Read + Write + event::Source {
     fn shrink_receive_buffer(&self) {}
+    fn host_description(&self) -> HostDescription;
+    fn port(&self) -> Option<u16> {
+        None
+    }
+    fn raw_fd(&self) -> Option<i32> {
+        None
+    }
 }
 
 #[cfg(unix)]
@@ -48,11 +73,31 @@ impl MioStream for TcpStream {
     fn shrink_receive_buffer(&self) {
         set_recv_buffer_floor(self);
     }
+    fn host_description(&self) -> HostDescription {
+        self.peer_addr()
+            .map(|a| HostDescription::Ip(a.ip()))
+            .unwrap_or(HostDescription::Unknown)
+    }
+    fn port(&self) -> Option<u16> {
+        self.peer_addr().ok().map(|a| a.port())
+    }
+    #[cfg(unix)]
+    fn raw_fd(&self) -> Option<i32> {
+        use std::os::fd::AsRawFd;
+        Some(self.as_raw_fd())
+    }
 }
 #[cfg(unix)]
 impl MioStream for UnixStream {
     fn shrink_receive_buffer(&self) {
         set_recv_buffer_floor(self);
+    }
+    fn host_description(&self) -> HostDescription {
+        HostDescription::Unix
+    }
+    fn raw_fd(&self) -> Option<i32> {
+        use std::os::fd::AsRawFd;
+        Some(self.as_raw_fd())
     }
 }
 
@@ -105,7 +150,10 @@ impl MioListener for AnyListener {
     type Stream = AnyStream;
     fn accept_stream(&self) -> Result<AnyStream> {
         match self {
-            AnyListener::Tcp(l) => l.accept_stream().map(AnyStream::Tcp),
+            AnyListener::Tcp(l) => {
+                let (stream, addr) = l.accept()?;
+                Ok(AnyStream::Tcp(stream, addr))
+            }
             #[cfg(unix)]
             AnyListener::Unix(l) => l.accept_stream().map(AnyStream::Unix),
         }
@@ -113,7 +161,7 @@ impl MioListener for AnyListener {
 }
 
 pub enum AnyStream {
-    Tcp(TcpStream),
+    Tcp(TcpStream, SocketAddr),
     #[cfg(unix)]
     Unix(UnixStream),
 }
@@ -121,7 +169,7 @@ pub enum AnyStream {
 impl Read for AnyStream {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         match self {
-            AnyStream::Tcp(s) => s.read(buf),
+            AnyStream::Tcp(s, _) => s.read(buf),
             #[cfg(unix)]
             AnyStream::Unix(s) => s.read(buf),
         }
@@ -131,7 +179,7 @@ impl Read for AnyStream {
 impl Write for AnyStream {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
         match self {
-            AnyStream::Tcp(s) => s.write(buf),
+            AnyStream::Tcp(s, _) => s.write(buf),
             #[cfg(unix)]
             AnyStream::Unix(s) => s.write(buf),
         }
@@ -139,7 +187,7 @@ impl Write for AnyStream {
 
     fn flush(&mut self) -> Result<()> {
         match self {
-            AnyStream::Tcp(s) => s.flush(),
+            AnyStream::Tcp(s, _) => s.flush(),
             #[cfg(unix)]
             AnyStream::Unix(s) => s.flush(),
         }
@@ -149,7 +197,7 @@ impl Write for AnyStream {
 impl event::Source for AnyStream {
     fn register(&mut self, registry: &Registry, token: Token, interests: Interest) -> Result<()> {
         match self {
-            AnyStream::Tcp(s) => s.register(registry, token, interests),
+            AnyStream::Tcp(s, _) => s.register(registry, token, interests),
             #[cfg(unix)]
             AnyStream::Unix(s) => s.register(registry, token, interests),
         }
@@ -157,7 +205,7 @@ impl event::Source for AnyStream {
 
     fn reregister(&mut self, registry: &Registry, token: Token, interests: Interest) -> Result<()> {
         match self {
-            AnyStream::Tcp(s) => s.reregister(registry, token, interests),
+            AnyStream::Tcp(s, _) => s.reregister(registry, token, interests),
             #[cfg(unix)]
             AnyStream::Unix(s) => s.reregister(registry, token, interests),
         }
@@ -165,7 +213,7 @@ impl event::Source for AnyStream {
 
     fn deregister(&mut self, registry: &Registry) -> Result<()> {
         match self {
-            AnyStream::Tcp(s) => s.deregister(registry),
+            AnyStream::Tcp(s, _) => s.deregister(registry),
             #[cfg(unix)]
             AnyStream::Unix(s) => s.deregister(registry),
         }
@@ -176,8 +224,29 @@ impl MioStream for AnyStream {
     #[cfg(unix)]
     fn shrink_receive_buffer(&self) {
         match self {
-            AnyStream::Tcp(s) => s.shrink_receive_buffer(),
+            AnyStream::Tcp(s, _) => s.shrink_receive_buffer(),
             AnyStream::Unix(s) => s.shrink_receive_buffer(),
+        }
+    }
+    fn host_description(&self) -> HostDescription {
+        match self {
+            AnyStream::Tcp(_, addr) => HostDescription::Ip(addr.ip()),
+            #[cfg(unix)]
+            AnyStream::Unix(s) => s.host_description(),
+        }
+    }
+    fn port(&self) -> Option<u16> {
+        match self {
+            AnyStream::Tcp(_, addr) => Some(addr.port()),
+            #[cfg(unix)]
+            AnyStream::Unix(s) => s.port(),
+        }
+    }
+    fn raw_fd(&self) -> Option<i32> {
+        match self {
+            AnyStream::Tcp(s, _) => s.raw_fd(),
+            #[cfg(unix)]
+            AnyStream::Unix(s) => s.raw_fd(),
         }
     }
 }

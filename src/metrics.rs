@@ -244,6 +244,7 @@ impl<Listener: MioListener> MetricServer<Listener> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::listener::HostDescription;
     use mio::Registry;
     use std::cell::{Cell, RefCell};
     use std::io::{self, Write};
@@ -301,7 +302,11 @@ mod tests {
             }
         }
 
-        impl MioStream for MockStream {}
+        impl MioStream for MockStream {
+            fn host_description(&self) -> HostDescription {
+                HostDescription::Unknown
+            }
+        }
 
         struct MockListener;
 

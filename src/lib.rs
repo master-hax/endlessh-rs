@@ -9,12 +9,29 @@ use std::fmt::Formatter;
 use std::io::{ErrorKind, Write};
 
 mod listener;
-pub use listener::{AnyListener, MioListener, MioStream};
+pub use listener::{AnyListener, HostDescription, MioListener, MioStream};
 
 #[cfg(feature = "metrics")]
 pub mod metrics;
 
 const SSH_LINE_BUFFER_SIZE: usize = 256;
+
+pub struct LogTimestamp(jiff::Timestamp);
+
+impl Display for LogTimestamp {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:.3}", self.0)
+    }
+}
+
+pub fn log_timestamp() -> LogTimestamp {
+    let since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let duration =
+        jiff::SignedDuration::new(since_epoch.as_secs() as i64, since_epoch.subsec_nanos() as i32);
+    LogTimestamp(jiff::Timestamp::from_duration(duration).unwrap_or(jiff::Timestamp::UNIX_EPOCH))
+}
 
 pub enum NewLine {
     LF,
@@ -27,6 +44,23 @@ impl NewLine {
         match self {
             NewLine::LF => &['\n' as u8],
             NewLine::CRLF => &['\r' as u8, '\n' as u8],
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Verbosity {
+    Quiet,
+    Info,
+    Debug,
+}
+
+impl From<u8> for Verbosity {
+    fn from(count: u8) -> Self {
+        match count {
+            0 => Verbosity::Quiet,
+            1 => Verbosity::Info,
+            _ => Verbosity::Debug,
         }
     }
 }
@@ -130,12 +164,14 @@ pub struct EndlesshServer<Listener: MioListener> {
     connections: VecDeque<EndlesshConnection<Listener::Stream>>,
     stats: EndlesshStats,
     options: EndlesshOptions,
+    verbosity: Verbosity,
 }
 
 struct EndlesshConnection<Stream: MioStream> {
     stream: Stream,
     connected_time: Instant,
     last_send_time: Option<Instant>,
+    bytes_sent: usize,
 }
 
 impl<Listener: MioListener> EndlesshServer<Listener> {
@@ -145,6 +181,7 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
         mut listener: Listener,
         listener_token: Token,
         poll: &Poll,
+        verbosity: Verbosity,
     ) -> Result<Self, EndlesshFatalError> {
         let newline_len = options.newline.get_data().len();
         if options.banner_line_length + newline_len > SSH_LINE_BUFFER_SIZE {
@@ -169,6 +206,7 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
             connections,
             stats: EndlesshStats::default(),
             options,
+            verbosity,
         })
     }
 
@@ -235,10 +273,28 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
             match self.listener.accept_stream() {
                 Ok(stream) => {
                     stream.shrink_receive_buffer();
+                    if self.verbosity >= Verbosity::Info {
+                        println!(
+                            "{} ACCEPT host={}{}{} n={}/{}",
+                            log_timestamp(),
+                            stream.host_description(),
+                            stream
+                                .port()
+                                .map(|port| format!(" port={port}"))
+                                .unwrap_or_default(),
+                            stream
+                                .raw_fd()
+                                .map(|fd| format!(" fd={fd}"))
+                                .unwrap_or_default(),
+                            self.connections.len() + 1,
+                            self.options.max_clients
+                        );
+                    }
                     self.connections.push_back(EndlesshConnection {
                         stream,
                         connected_time: *now,
                         last_send_time: None,
+                        bytes_sent: 0,
                     });
                     self.stats.connections_opened += 1;
                 }
@@ -273,11 +329,13 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
         ) {
             Ok(0) => {
                 // connection closed, goodbye 👋
+                self.log_close(&connection, now);
                 None
             }
             Ok(n) => {
                 // send (at least partially) succeeded
                 self.stats.bytes_sent += n;
+                connection.bytes_sent += n;
                 self.stats.trapped_time += now.duration_since(
                     connection
                         .last_send_time
@@ -293,8 +351,31 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
             }
             Err(_e) => {
                 // 🤷 goodbye 👋
+                self.log_close(&connection, now);
                 None
             }
+        }
+    }
+
+    fn log_close(&self, connection: &EndlesshConnection<Listener::Stream>, now: &Instant) {
+        if self.verbosity >= Verbosity::Info {
+            println!(
+                "{} CLOSE host={}{}{} time={:.3} bytes={}",
+                log_timestamp(),
+                connection.stream.host_description(),
+                connection
+                    .stream
+                    .port()
+                    .map(|port| format!(" port={port}"))
+                    .unwrap_or_default(),
+                connection
+                    .stream
+                    .raw_fd()
+                    .map(|fd| format!(" fd={fd}"))
+                    .unwrap_or_default(),
+                now.duration_since(connection.connected_time).as_secs_f64(),
+                connection.bytes_sent
+            );
         }
     }
 }

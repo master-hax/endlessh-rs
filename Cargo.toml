@@ -21,6 +21,7 @@ clap = { version = "4.5.20", features = ["derive"] }
 fastrand = "2.2.0"
 mio = { version = "1.0.2", features = ["os-poll", "net"] }
 httparse = { version = "1.9.5", optional = true }
+jiff = { version = "0.2.38", default-features = false, features = ["alloc"] }
 
 [features]
 default = [ "metrics" ]
