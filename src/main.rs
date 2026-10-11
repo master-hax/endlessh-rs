@@ -12,7 +12,7 @@ use mio::net::TcpListener;
 use mio::{event, Events, Interest, Poll, Token};
 use std::time::{Duration, Instant};
 
-use endlessh::{EndlesshOptions, EndlesshServer, MioListener, NewLine};
+use endlessh::{AnyListener, EndlesshOptions, EndlesshServer, NewLine};
 
 #[cfg(unix)]
 use endlessh::EndlesshStats;
@@ -27,44 +27,68 @@ use mio_signals::{Signal, Signals};
 use endlessh::metrics::MetricServer;
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
-enum MultiListener {
+enum ListenerAddress {
     Ip(SocketAddr),
     Unix(PathBuf),
     Disabled,
 }
 
-impl From<&str> for MultiListener {
-    fn from(v: &str) -> MultiListener {
+impl From<&str> for ListenerAddress {
+    fn from(v: &str) -> ListenerAddress {
         if v == "disabled" {
-            MultiListener::Disabled
+            ListenerAddress::Disabled
         } else if v.starts_with("ip:") {
             let to_parse: &str = &v[3..];
             match to_parse.parse::<SocketAddr>() {
-                Ok(s) => MultiListener::Ip(s),
+                Ok(s) => ListenerAddress::Ip(s),
                 Err(e) => panic!("bad ip address - {}", e),
             }
         } else if v.starts_with("unix:") {
-            MultiListener::Unix(PathBuf::from(&v[5..]))
+            ListenerAddress::Unix(PathBuf::from(&v[5..]))
         } else {
             panic!("listener must be of the form \"disabled|ip:<socketaddr>|unix:<socketpath>\"")
         }
     }
 }
 
-impl std::fmt::Display for MultiListener {
+impl std::fmt::Display for ListenerAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         match &self {
-            &MultiListener::Ip(i) => {
+            &ListenerAddress::Ip(i) => {
                 write!(f, "ip:{}", i)
             }
-            &MultiListener::Unix(p) => {
+            &ListenerAddress::Unix(p) => {
                 write!(f, "unix:{}", p.display())
             }
-            &MultiListener::Disabled => {
+            &ListenerAddress::Disabled => {
                 write!(f, "disabled")
             }
         }?;
         Ok(())
+    }
+}
+
+impl ListenerAddress {
+    fn bind(&self, purpose: &str) -> Option<AnyListener> {
+        let listener = match self {
+            ListenerAddress::Disabled => return None,
+            ListenerAddress::Ip(ip) => AnyListener::from(
+                TcpListener::bind(*ip)
+                    .unwrap_or_else(|e| panic!("failed to bind {purpose} socket: {e}")),
+            ),
+            #[cfg(unix)]
+            ListenerAddress::Unix(path) => {
+                let _ = remove_file(path);
+                AnyListener::from(
+                    UnixListener::bind(path)
+                        .unwrap_or_else(|e| panic!("failed to bind {purpose} socket: {e}")),
+                )
+            }
+            #[cfg(not(unix))]
+            ListenerAddress::Unix(_) => panic!("unix sockets are not supported on this platform"),
+        };
+        println!("endlessh-rs listening for {purpose} connections on {self}");
+        Some(listener)
     }
 }
 
@@ -73,10 +97,10 @@ impl std::fmt::Display for MultiListener {
 struct Args {
     #[arg(
         long,
-        default_value_t=MultiListener::Ip(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 2222))),
+        default_value_t=ListenerAddress::Ip(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 2222))),
         help = "address to accept ssh connections on, in the form \"ip:<socketaddr>\" or \"unix:<socketpath>\""
     )]
-    ssh_listen_address: MultiListener,
+    ssh_listen_address: ListenerAddress,
     #[arg(
         long,
         default_value_t = 32,
@@ -98,10 +122,10 @@ struct Args {
     #[cfg(feature = "metrics")]
     #[arg(
         long,
-        default_value_t = MultiListener::Disabled,
+        default_value_t = ListenerAddress::Disabled,
         help = "address to serve openmetrics/prometheus stats on, in the form \"disabled\", \"ip:<socketaddr>\", or \"unix:<socketpath>\""
     )]
-    metrics_listen_address: MultiListener,
+    metrics_listen_address: ListenerAddress,
     #[cfg(feature = "metrics")]
     #[arg(
         long,
@@ -165,12 +189,17 @@ impl SignalHandler {
     }
 }
 
-#[cfg(feature = "metrics")]
-fn event_loop<SshListener: MioListener, MetricsListener: MioListener>(
+fn next_token(counter: &mut usize) -> Token {
+    let token = Token(*counter);
+    *counter += 1;
+    token
+}
+
+fn event_loop(
     mut poll: Poll,
     mut events: Events,
-    mut endlessh_server: EndlesshServer<SshListener>,
-    mut metric_server: Option<MetricServer<MetricsListener>>,
+    mut endlessh_server: EndlesshServer<AnyListener>,
+    #[cfg(feature = "metrics")] mut metric_server: Option<MetricServer<AnyListener>>,
     #[cfg(unix)] mut signal_handler: SignalHandler,
 ) {
     let mut timeout = None;
@@ -185,6 +214,7 @@ fn event_loop<SshListener: MioListener, MetricsListener: MioListener>(
         for event in events.iter() {
             match event.token() {
                 _ if endlessh_server.try_handle_event(event, &loop_time) => {}
+                #[cfg(feature = "metrics")]
                 _ if metric_server.as_mut().is_some_and(|m| {
                     m.try_handle_event(event, &mut poll, endlessh_server.stats())
                 }) => {}
@@ -201,133 +231,6 @@ fn event_loop<SshListener: MioListener, MetricsListener: MioListener>(
         }
         timeout = endlessh_server.handle_wakeup(&loop_time);
     }
-}
-
-#[cfg(not(feature = "metrics"))]
-fn event_loop<SshListener: MioListener>(
-    mut poll: Poll,
-    mut events: Events,
-    mut endlessh_server: EndlesshServer<SshListener>,
-    #[cfg(unix)] mut signal_handler: SignalHandler,
-) {
-    let mut timeout = None;
-    loop {
-        if let Err(err) = poll.poll(&mut events, timeout) {
-            if err.kind() != Interrupted {
-                eprintln!("failed to poll: {}", err);
-            }
-            continue;
-        }
-        let loop_time = Instant::now();
-        for event in events.iter() {
-            match event.token() {
-                _ if endlessh_server.try_handle_event(event, &loop_time) => {}
-                #[cfg(unix)]
-                _ if signal_handler.try_handle_event(event, endlessh_server.stats()) => {
-                    if signal_handler.should_terminate() {
-                        return;
-                    }
-                }
-                rando_token => {
-                    panic!("unexpected token {}", rando_token.0);
-                }
-            }
-        }
-        timeout = endlessh_server.handle_wakeup(&loop_time);
-    }
-}
-
-/// binds the metrics listener (if enabled) and hands off to [`event_loop`].
-///
-/// this can't be folded into `event_loop` directly: the metrics listener's transport
-/// (TCP vs unix) is also chosen at runtime, so each transport needs its own call site
-/// for the compiler to monomorphize `MetricServer<MetricsListener>` against.
-#[cfg(feature = "metrics")]
-fn run<Listener: MioListener>(
-    poll: Poll,
-    events: Events,
-    endlessh_server: EndlesshServer<Listener>,
-    args: &Args,
-    #[cfg(unix)] signal_handler: SignalHandler,
-    metric_server_token: Token,
-    metric_client_token_start: usize,
-) {
-    match &args.metrics_listen_address {
-        MultiListener::Disabled => event_loop(
-            poll,
-            events,
-            endlessh_server,
-            None::<MetricServer<TcpListener>>,
-            #[cfg(unix)]
-            signal_handler,
-        ),
-        MultiListener::Ip(ip) => {
-            let tcp_listener =
-                TcpListener::bind(*ip).expect("failed to bind to metrics TCP socket");
-            println!(
-                "endlessh-rs listening for metrics connections on {}",
-                args.metrics_listen_address
-            );
-            let metric_server = MetricServer::new(
-                &poll,
-                tcp_listener,
-                metric_server_token,
-                metric_client_token_start..metric_client_token_start + args.metrics_max_clients,
-            );
-            event_loop(
-                poll,
-                events,
-                endlessh_server,
-                Some(metric_server),
-                #[cfg(unix)]
-                signal_handler,
-            );
-        }
-        #[cfg(unix)]
-        MultiListener::Unix(path) => {
-            let _ = remove_file(path);
-            let unix_listener =
-                UnixListener::bind(path).expect("failed to bind to metrics unix socket");
-            println!(
-                "endlessh-rs listening for metrics connections on {}",
-                args.metrics_listen_address
-            );
-            let metric_server = MetricServer::new(
-                &poll,
-                unix_listener,
-                metric_server_token,
-                metric_client_token_start..metric_client_token_start + args.metrics_max_clients,
-            );
-            event_loop(poll, events, endlessh_server, Some(metric_server), signal_handler);
-        }
-        #[cfg(not(unix))]
-        MultiListener::Unix(_) => {
-            panic!("unix sockets are not supported on this platform")
-        }
-    }
-}
-
-#[cfg(not(feature = "metrics"))]
-fn run<Listener: MioListener>(
-    poll: Poll,
-    events: Events,
-    endlessh_server: EndlesshServer<Listener>,
-    _args: &Args,
-    #[cfg(unix)] signal_handler: SignalHandler,
-) {
-    event_loop(
-        poll,
-        events,
-        endlessh_server,
-        #[cfg(unix)]
-        signal_handler,
-    );
-}
-
-fn next_token(counter: &mut usize) -> Token {
-    let token = Token(*counter);
-    *counter += 1;
-    token
 }
 
 fn main() {
@@ -353,57 +256,29 @@ fn main() {
         newline: NewLine::LF,
     };
 
-    match &args.ssh_listen_address {
-        MultiListener::Ip(ip) => {
-            let tcp_listener = TcpListener::bind(*ip).expect("failed to bind to ssh TCP socket");
-            println!(
-                "endlessh-rs listening for ssh connections on {}",
-                args.ssh_listen_address
-            );
-            let endlessh_server =
-                EndlesshServer::new(ssh_options, tcp_listener, ssh_server_token, &poll);
-            run(
-                poll,
-                events,
-                endlessh_server,
-                args,
-                #[cfg(unix)]
-                signal_handler,
-                #[cfg(feature = "metrics")]
-                metric_server_token,
-                #[cfg(feature = "metrics")]
-                metric_client_token_start,
-            );
-        }
+    let ssh_listener = args
+        .ssh_listen_address
+        .bind("ssh")
+        .expect("ssh listener cannot be disabled");
+    let endlessh_server = EndlesshServer::new(ssh_options, ssh_listener, ssh_server_token, &poll);
+
+    #[cfg(feature = "metrics")]
+    let metric_server = args.metrics_listen_address.bind("metrics").map(|listener| {
+        MetricServer::new(
+            &poll,
+            listener,
+            metric_server_token,
+            metric_client_token_start..metric_client_token_start + args.metrics_max_clients,
+        )
+    });
+
+    event_loop(
+        poll,
+        events,
+        endlessh_server,
+        #[cfg(feature = "metrics")]
+        metric_server,
         #[cfg(unix)]
-        MultiListener::Unix(path) => {
-            let _ = remove_file(path);
-            let unix_listener =
-                UnixListener::bind(path).expect("failed to bind to ssh unix socket");
-            println!(
-                "endlessh-rs listening for ssh connections on {}",
-                args.ssh_listen_address
-            );
-            let endlessh_server =
-                EndlesshServer::new(ssh_options, unix_listener, ssh_server_token, &poll);
-            run(
-                poll,
-                events,
-                endlessh_server,
-                args,
-                signal_handler,
-                #[cfg(feature = "metrics")]
-                metric_server_token,
-                #[cfg(feature = "metrics")]
-                metric_client_token_start,
-            );
-        }
-        #[cfg(not(unix))]
-        MultiListener::Unix(_) => {
-            panic!("unix sockets are not supported on this platform")
-        }
-        MultiListener::Disabled => {
-            panic!("ssh listener cannot be disabled")
-        }
-    }
+        signal_handler,
+    );
 }

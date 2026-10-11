@@ -8,7 +8,7 @@ use std::fmt::Formatter;
 use std::io::{ErrorKind, Write};
 
 mod listener;
-pub use listener::{MioListener, MioStream};
+pub use listener::{AnyListener, MioListener, MioStream};
 
 #[cfg(feature = "metrics")]
 pub mod metrics;
