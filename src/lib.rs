@@ -219,7 +219,8 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
                     self.listener_accept_available = false;
                 }
                 Err(e) => {
-                    panic!("failed to accept connection: {}", e);
+                    eprintln!("failed to accept ssh connection: {}", e);
+                    break;
                 }
             };
         }
