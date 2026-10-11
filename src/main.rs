@@ -120,10 +120,10 @@ fn event_loop<SshListener: MioListener, MetricsListener: MioListener>(
     let mut timeout = None;
     loop {
         if let Err(err) = poll.poll(&mut events, timeout) {
-            if err.kind() == Interrupted {
-                continue;
+            if err.kind() != Interrupted {
+                eprintln!("failed to poll: {}", err);
             }
-            panic!("failed to poll: {}", err);
+            continue;
         }
         let loop_time = Instant::now();
         for event in events.iter() {
@@ -150,10 +150,10 @@ fn event_loop<SshListener: MioListener>(
     let mut timeout = None;
     loop {
         if let Err(err) = poll.poll(&mut events, timeout) {
-            if err.kind() == Interrupted {
-                continue;
+            if err.kind() != Interrupted {
+                eprintln!("failed to poll: {}", err);
             }
-            panic!("failed to poll: {}", err);
+            continue;
         }
         let loop_time = Instant::now();
         for event in events.iter() {
