@@ -1,6 +1,7 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
-use std::io::{copy, Cursor, Read};
+use std::io::{Read, Write};
 
 use httparse::Request;
 use mio::Poll;
@@ -24,7 +25,7 @@ type HttpRequestBuffer = [u8; METRIC_HTTP_REQUEST_MAX_SIZE];
 
 enum MetricRequestStatus {
     ReadingRequest(HttpRequestBuffer, usize),
-    WritingResponse(Box<dyn Read>),
+    WritingResponse(Cow<'static, [u8]>, usize),
 }
 
 struct HttpClient<Stream: MioStream> {
@@ -164,7 +165,7 @@ impl<Listener: MioListener> MetricServer<Listener> {
         poll: &mut Poll,
         token: &Token,
         mut client: HttpClient<Listener::Stream>,
-        response: Box<dyn Read>,
+        response: Cow<'static, [u8]>,
     ) -> Option<HttpClient<Listener::Stream>> {
         if let Err(e) =
             poll.registry()
@@ -173,7 +174,7 @@ impl<Listener: MioListener> MetricServer<Listener> {
             eprintln!("failed to reregister metrics client: {}", e);
             return Self::close(poll, client);
         }
-        client.connection_status = MetricRequestStatus::WritingResponse(response);
+        client.connection_status = MetricRequestStatus::WritingResponse(response, 0);
         Some(client)
     }
 
@@ -185,9 +186,9 @@ impl<Listener: MioListener> MetricServer<Listener> {
         http_response_body: &impl ToString,
     ) -> Option<HttpClient<Listener::Stream>> {
         match &mut client.connection_status {
-            MetricRequestStatus::ReadingRequest(buffer, current_position) => {
-                // bounded read - can't overflow `buffer`, unlike `std::io::copy`
-                match client.stream.read(&mut buffer[*current_position..]) {
+            MetricRequestStatus::ReadingRequest(request_buffer, current_position) => {
+                // bounded read - can't overflow `request_buffer`, unlike `std::io::copy`
+                match client.stream.read(&mut request_buffer[*current_position..]) {
                     Ok(0) => return Self::close(poll, client),
                     Ok(n) => {
                         *current_position += n;
@@ -195,17 +196,18 @@ impl<Listener: MioListener> MetricServer<Listener> {
                     Err(e) if e.kind() == ErrorKind::WouldBlock => {}
                     Err(_e) => return Self::close(poll, client),
                 };
-                let request_too_big = *current_position >= buffer.len();
+                let request_too_big = *current_position >= request_buffer.len();
                 let mut headers = [httparse::EMPTY_HEADER; METRIC_HTTP_MAX_HEADERS];
                 let mut request_parser = Request::new(&mut headers);
-                let response: Box<dyn Read> = match request_parser.parse(&buffer[..*current_position])
+                let response: Cow<'static, [u8]> = match request_parser
+                    .parse(&request_buffer[..*current_position])
                 {
                     // request too big for our buffer, or has too many header fields
                     Ok(Status::Partial) if request_too_big => {
-                        Box::new(Cursor::new(HTTP_431_RESPONSE))
+                        Cow::Borrowed(HTTP_431_RESPONSE.as_bytes())
                     }
                     Err(httparse::Error::TooManyHeaders) => {
-                        Box::new(Cursor::new(HTTP_431_RESPONSE))
+                        Cow::Borrowed(HTTP_431_RESPONSE.as_bytes())
                     }
                     Ok(Status::Partial) => return Some(client),
                     Err(_e) => return Self::close(poll, client),
@@ -213,25 +215,151 @@ impl<Listener: MioListener> MetricServer<Listener> {
                     Ok(Status::Complete(_)) => match request_parser.path {
                         Some("/metrics") => match request_parser.method {
                             Some("GET") => {
-                                Box::new(Cursor::new(generate_http_response(http_response_body)))
+                                Cow::Owned(generate_http_response(http_response_body).into_bytes())
                             }
-                            _ => Box::new(Cursor::new(HTTP_405_RESPONSE)),
+                            _ => Cow::Borrowed(HTTP_405_RESPONSE.as_bytes()),
                         },
-                        _ => Box::new(Cursor::new(HTTP_404_RESPONSE)),
+                        _ => Cow::Borrowed(HTTP_404_RESPONSE.as_bytes()),
                     },
                 };
                 Self::respond(poll, token, client, response)
             }
-            MetricRequestStatus::WritingResponse(to_write) => {
-                match copy(to_write, &mut client.stream) {
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => return Some(client),
-                    _ => {}
-                };
+            MetricRequestStatus::WritingResponse(response, written) => {
+                while *written < response.len() {
+                    match client.stream.write(&response[*written..]) {
+                        Ok(0) => return Self::close(poll, client),
+                        Ok(n) => *written += n,
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => return Some(client),
+                        Err(_e) => return Self::close(poll, client),
+                    }
+                }
                 if let Err(e) = poll.registry().deregister(&mut client.stream) {
                     eprintln!("failed to deregister metrics client: {}", e);
                 }
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mio::Registry;
+    use std::cell::{Cell, RefCell};
+    use std::io::{self, Write};
+    use std::rc::Rc;
+
+    #[test]
+    fn would_block_mid_write_does_not_lose_response_bytes() {
+        #[derive(Clone)]
+        struct MockStream {
+            written: Rc<RefCell<Vec<u8>>>,
+            write_call: Rc<Cell<usize>>,
+            partial_n: usize,
+        }
+
+        impl Read for MockStream {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                Ok(0)
+            }
+        }
+
+        impl Write for MockStream {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                let call = self.write_call.get() + 1;
+                self.write_call.set(call);
+                match call {
+                    // first write: socket only accepts part of the buffer
+                    1 => {
+                        let n = self.partial_n.min(buf.len());
+                        self.written.borrow_mut().extend_from_slice(&buf[..n]);
+                        Ok(n)
+                    }
+                    // second write: socket send buffer is now full
+                    2 => Err(io::Error::from(ErrorKind::WouldBlock)),
+                    // once polled again, the socket can accept the rest
+                    _ => {
+                        self.written.borrow_mut().extend_from_slice(buf);
+                        Ok(buf.len())
+                    }
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl event::Source for MockStream {
+            fn register(&mut self, _r: &Registry, _t: Token, _i: Interest) -> io::Result<()> {
+                Ok(())
+            }
+            fn reregister(&mut self, _r: &Registry, _t: Token, _i: Interest) -> io::Result<()> {
+                Ok(())
+            }
+            fn deregister(&mut self, _r: &Registry) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl MioStream for MockStream {}
+
+        struct MockListener;
+
+        impl event::Source for MockListener {
+            fn register(&mut self, _r: &Registry, _t: Token, _i: Interest) -> io::Result<()> {
+                Ok(())
+            }
+            fn reregister(&mut self, _r: &Registry, _t: Token, _i: Interest) -> io::Result<()> {
+                Ok(())
+            }
+            fn deregister(&mut self, _r: &Registry) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl MioListener for MockListener {
+            type Stream = MockStream;
+            fn accept_stream(&self) -> io::Result<MockStream> {
+                unreachable!("test never accepts a connection")
+            }
+        }
+
+        let mut poll = Poll::new().unwrap();
+        let server = MetricServer::new(&poll, MockListener, Token(0), 1..2);
+
+        let body = "hello world, this is the full metrics response body".to_string();
+        let written = Rc::new(RefCell::new(Vec::new()));
+        let stream = MockStream {
+            written: written.clone(),
+            write_call: Rc::new(Cell::new(0)),
+            partial_n: 5,
+        };
+        let client = HttpClient {
+            stream,
+            connection_status: MetricRequestStatus::WritingResponse(
+                Cow::Owned(body.clone().into_bytes()),
+                0,
+            ),
+        };
+        let token = Token(2);
+
+        // first poll: partial write then WouldBlock - connection must stay open to retry
+        let client = server
+            .handle_client(&mut poll, &token, client, &"unused")
+            .expect("connection should remain open to retry after WouldBlock");
+
+        // second poll: must finish sending the REST of the body, not skip past it
+        let client = server.handle_client(&mut poll, &token, client, &"unused");
+        assert!(
+            client.is_none(),
+            "connection should close once the full response is sent"
+        );
+
+        assert_eq!(
+            written.borrow().as_slice(),
+            body.as_bytes(),
+            "response body must not be truncated by a WouldBlock that occurs mid-write"
+        );
     }
 }
