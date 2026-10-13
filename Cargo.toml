@@ -8,6 +8,9 @@ readme = "README.md"
 repository = "https://github.com/master-hax/endlessh-rs.git"
 license = "MIT OR Apache-2.0"
 
+[profile.release]
+strip = "symbols"
+
 [lib]
 name = "endlessh"
 path = "src/lib.rs"
@@ -22,6 +25,7 @@ fastrand = "2.2.0"
 mio = { version = "1.0.2", features = ["os-poll", "net"] }
 httparse = { version = "1.9.5", optional = true }
 jiff = { version = "0.2.38", default-features = false, features = ["alloc"] }
+socket2 = "0.6.5"
 
 [features]
 default = [ "metrics" ]
@@ -29,4 +33,3 @@ metrics = [ "httparse" ]
 
 [target."cfg(unix)".dependencies]
 mio-signals = "0.3.0"
-socket2 = "0.6.5"
