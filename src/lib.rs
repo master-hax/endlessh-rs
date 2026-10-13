@@ -183,6 +183,7 @@ struct EndlesshConnection<Stream: MioStream> {
     peer_ip: Option<IpAddr>,
     connected_time: Instant,
     last_send_time: Option<Instant>,
+    retry_after: Option<Instant>,
     bytes_sent: usize,
 }
 
@@ -221,6 +222,20 @@ fn release_ip(counts: &mut HashMap<IpAddr, usize>, ip: IpAddr) {
 // periodic banner writes responsive during connection floods.
 const MAX_ACCEPTS_PER_TICK: usize = 128;
 const PENDING_ACCEPT_RETRY: Duration = Duration::from_millis(20);
+const BLOCKED_SEND_RETRY: Duration = Duration::from_millis(250);
+
+fn send_wait(
+    last_send_time: Option<Instant>,
+    retry_after: Option<Instant>,
+    now: Instant,
+    message_delay: Duration,
+) -> Duration {
+    let interval = last_send_time.map_or(Duration::ZERO, |last| {
+        (last + message_delay).saturating_duration_since(now)
+    });
+    let retry = retry_after.map_or(Duration::ZERO, |until| until.saturating_duration_since(now));
+    interval.max(retry)
+}
 
 impl<Listener: MioListener> EndlesshServer<Listener> {
     /// Backwards-compatible constructor for a single listener.
@@ -331,11 +346,13 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
         let queued = self.connections.len();
         for _ in 0..queued {
             let mut connection = self.connections.pop_front().unwrap();
-            let send_or_wait = connection.last_send_time.and_then(|last_send| {
-                (last_send + self.options.message_delay).checked_duration_since(*now)
-            });
-
-            if send_or_wait.is_some() {
+            let wait = send_wait(
+                connection.last_send_time,
+                connection.retry_after,
+                *now,
+                self.options.message_delay,
+            );
+            if !wait.is_zero() {
                 self.connections.push_back(connection);
                 continue;
             }
@@ -362,11 +379,17 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
             .connections
             .iter()
             .map(|connection| {
-                connection
-                    .last_send_time
-                    .map_or(PENDING_ACCEPT_RETRY, |last_send| {
-                        (last_send + self.options.message_delay).saturating_duration_since(*now)
-                    })
+                let wait = send_wait(
+                    connection.last_send_time,
+                    connection.retry_after,
+                    *now,
+                    self.options.message_delay,
+                );
+                if connection.last_send_time.is_none() && connection.retry_after.is_none() {
+                    PENDING_ACCEPT_RETRY
+                } else {
+                    wait
+                }
             })
             .min();
         self.next_timeout(next_banner)
@@ -447,6 +470,7 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
                             peer_ip,
                             connected_time: *now,
                             last_send_time: None,
+                            retry_after: None,
                             bytes_sent: 0,
                         });
                         self.stats.connections_opened += 1;
@@ -490,6 +514,7 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
                 false
             }
             Ok(n) => {
+                connection.retry_after = None;
                 self.stats.bytes_sent += n;
                 connection.bytes_sent += n;
                 self.stats.trapped_time += now.duration_since(
@@ -500,7 +525,10 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
                 connection.last_send_time = Some(*now);
                 true
             }
-            Err(ref err) if err.kind() == ErrorKind::WouldBlock => true,
+            Err(ref err) if err.kind() == ErrorKind::WouldBlock => {
+                connection.retry_after = Some(*now + BLOCKED_SEND_RETRY);
+                true
+            }
             Err(_) => {
                 self.log_close(connection, now);
                 false
@@ -535,6 +563,38 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn blocked_write_schedules_retry_instead_of_spinning() {
+        let now = Instant::now();
+        let delay = Duration::from_secs(10);
+        let last_send = now - delay;
+        let retry_after = now + BLOCKED_SEND_RETRY;
+        assert_eq!(
+            send_wait(Some(last_send), Some(retry_after), now, delay),
+            BLOCKED_SEND_RETRY
+        );
+        assert_eq!(
+            send_wait(None, Some(retry_after), now, delay),
+            BLOCKED_SEND_RETRY
+        );
+        assert_eq!(
+            send_wait(Some(last_send), Some(retry_after), retry_after, delay),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn normal_banner_interval_is_preserved() {
+        let now = Instant::now();
+        let delay = Duration::from_secs(10);
+        assert_eq!(send_wait(Some(now), None, now, delay), delay);
+        assert_eq!(
+            send_wait(Some(now), Some(now + BLOCKED_SEND_RETRY), now, delay),
+            delay
+        );
+        assert_eq!(send_wait(None, None, now, delay), Duration::ZERO);
+    }
 
     #[test]
     fn mapped_ipv4_addresses_share_the_same_key() {
