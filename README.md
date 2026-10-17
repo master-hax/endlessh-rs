@@ -21,6 +21,8 @@ Options:
           length, in bytes, of each randomly generated banner line sent to ssh clients [default: 32]
       --ssh-max-clients <SSH_MAX_CLIENTS>
           maximum number of ssh clients to trap at once [default: 4096]
+      --ssh-max-clients-per-ip <SSH_MAX_CLIENTS_PER_IP>
+          maximum concurrent SSH connections per source IP [default: 16]
       --ssh-message-delay-ms <SSH_MESSAGE_DELAY_MS>
           delay, in milliseconds, between banner lines sent to each trapped ssh client [default: 10000]
       --metrics-listen-address <METRICS_LISTEN_ADDRESS>
@@ -32,6 +34,14 @@ Options:
   -V, --version
           Print version
 ```
+
+## Per-IP connection limit
+
+`--ssh-max-clients-per-ip` (default: 16) limits concurrent TCP clients
+from the same IP address on the existing SSH listener. IPv4-mapped IPv6
+addresses share their IPv4 quota. Unix socket clients count only towards
+the global `--ssh-max-clients` limit. Rejected connections are immediately
+closed and logged only at debug verbosity (`-vv`).
 
 ## TODO
 

@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use mio::{event, Interest};
 use mio::{Poll, Token};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::net::IpAddr;
 use std::fmt::Formatter;
 use std::io::{ErrorKind, Write};
 
@@ -90,6 +91,7 @@ impl From<std::io::Error> for EndlesshFatalError {
 
 pub struct EndlesshOptions {
     pub max_clients: usize,
+    pub max_clients_per_ip: usize,
     pub banner_line_length: usize,
     pub message_delay: Duration,
     pub newline: NewLine,
@@ -99,6 +101,7 @@ impl Default for EndlesshOptions {
     fn default() -> Self {
         EndlesshOptions {
             max_clients: 4096,
+            max_clients_per_ip: 16,
             banner_line_length: 32,
             message_delay: Duration::from_secs(10),
             newline: NewLine::LF,
@@ -162,6 +165,7 @@ pub struct EndlesshServer<Listener: MioListener> {
     listener_accept_available: bool,
     line_buffer: [u8; SSH_LINE_BUFFER_SIZE],
     connections: VecDeque<EndlesshConnection<Listener::Stream>>,
+    connections_by_ip: HashMap<IpAddr, usize>,
     stats: EndlesshStats,
     options: EndlesshOptions,
     verbosity: Verbosity,
@@ -169,10 +173,46 @@ pub struct EndlesshServer<Listener: MioListener> {
 
 struct EndlesshConnection<Stream: MioStream> {
     stream: Stream,
+    peer_ip: Option<IpAddr>,
     connected_time: Instant,
     last_send_time: Option<Instant>,
     bytes_sent: usize,
 }
+
+/// Normalize IPv4-mapped IPv6 addresses for quota accounting.
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ip6) => ip6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(ip6)),
+        ip4 => ip4,
+    }
+}
+
+fn reserve_ip(counts: &mut HashMap<IpAddr, usize>, ip: Option<IpAddr>, limit: usize) -> bool {
+    if let Some(ip) = ip {
+        let current = counts.get(&ip).copied().unwrap_or(0);
+        if current >= limit {
+            return false;
+        }
+        *counts.entry(ip).or_insert(0) += 1;
+    }
+    true
+}
+
+fn release_ip(counts: &mut HashMap<IpAddr, usize>, ip: IpAddr) {
+    if let Some(count) = counts.get_mut(&ip) {
+        *count -= 1;
+        if *count == 0 {
+            counts.remove(&ip);
+        }
+    }
+}
+
+// Bound accept bursts, including rejected clients, to keep the event loop responsive.
+const MAX_ACCEPTS_PER_TICK: usize = 128;
+const PENDING_ACCEPT_RETRY: Duration = Duration::from_millis(20);
 
 impl<Listener: MioListener> EndlesshServer<Listener> {
     /// Creates an [`EndlesshServer`] that accepts ssh connections on `listener`.
@@ -183,6 +223,11 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
         poll: &Poll,
         verbosity: Verbosity,
     ) -> Result<Self, EndlesshFatalError> {
+        if options.max_clients_per_ip == 0 {
+            return Err(EndlesshFatalError::InvalidOptions(Cow::Borrowed(
+                "ssh-max-clients-per-ip must be positive",
+            )));
+        }
         let newline_len = options.newline.get_data().len();
         if options.banner_line_length + newline_len > SSH_LINE_BUFFER_SIZE {
             return Err(EndlesshFatalError::InvalidOptions(Cow::Owned(format!(
@@ -204,6 +249,7 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
             listener_accept_available: false,
             line_buffer,
             connections,
+            connections_by_ip: HashMap::new(),
             stats: EndlesshStats::default(),
             options,
             verbosity,
@@ -257,9 +303,19 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
                 }
                 Some(need_to_wait) => {
                     self.connections.push_back(connection);
-                    return Some(need_to_wait);
+                    return Some(if self.listener_accept_available
+                        && self.connections.len() < self.options.max_clients
+                    {
+                        need_to_wait.min(PENDING_ACCEPT_RETRY)
+                    } else {
+                        need_to_wait
+                    });
                 }
             }
+        }
+        if self.listener_accept_available && self.connections.len() < self.options.max_clients {
+            self.accept_new_connections(now);
+            return Some(PENDING_ACCEPT_RETRY);
         }
         None
     }
@@ -269,9 +325,32 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
     }
 
     fn accept_new_connections(&mut self, now: &Instant) {
-        while self.listener_accept_available && self.connections.len() < self.options.max_clients {
+        let mut attempts = 0;
+        while self.listener_accept_available
+            && self.connections.len() < self.options.max_clients
+            && attempts < MAX_ACCEPTS_PER_TICK
+        {
             match self.listener.accept_stream() {
                 Ok(stream) => {
+                    attempts += 1;
+                    let peer_ip = match stream.host_description() {
+                        HostDescription::Ip(ip) => Some(canonical_ip(ip)),
+                        _ => None,
+                    };
+                    if !reserve_ip(
+                        &mut self.connections_by_ip,
+                        peer_ip,
+                        self.options.max_clients_per_ip,
+                    ) {
+                        if self.verbosity >= Verbosity::Debug {
+                            println!(
+                                "{} REJECT host={} reason=per-ip-limit",
+                                log_timestamp(),
+                                stream.host_description()
+                            );
+                        }
+                        continue;
+                    }
                     stream.shrink_receive_buffer();
                     if self.verbosity >= Verbosity::Info {
                         println!(
@@ -292,6 +371,7 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
                     }
                     self.connections.push_back(EndlesshConnection {
                         stream,
+                        peer_ip,
                         connected_time: *now,
                         last_send_time: None,
                         bytes_sent: 0,
@@ -330,6 +410,9 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
             Ok(0) => {
                 // connection closed, goodbye 👋
                 self.log_close(&connection, now);
+                if let Some(ip) = connection.peer_ip {
+                    release_ip(&mut self.connections_by_ip, ip);
+                }
                 None
             }
             Ok(n) => {
@@ -352,6 +435,9 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
             Err(_e) => {
                 // 🤷 goodbye 👋
                 self.log_close(&connection, now);
+                if let Some(ip) = connection.peer_ip {
+                    release_ip(&mut self.connections_by_ip, ip);
+                }
                 None
             }
         }
@@ -377,5 +463,41 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
                 connection.bytes_sent
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod per_ip_tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn ipv4_mapped_ipv6_uses_ipv4_quota() {
+        let ipv4 = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let mapped = IpAddr::V6(Ipv4Addr::new(192, 0, 2, 1).to_ipv6_mapped());
+        assert_eq!(canonical_ip(ipv4), canonical_ip(mapped));
+    }
+
+    #[test]
+    fn quota_counts_active_connections_and_releases_on_close() {
+        let ip = Some("192.0.2.1".parse().unwrap());
+        let other = Some("192.0.2.2".parse().unwrap());
+        let mut counts = HashMap::new();
+        assert!(reserve_ip(&mut counts, ip, 2));
+        assert!(reserve_ip(&mut counts, ip, 2));
+        assert!(!reserve_ip(&mut counts, ip, 2));
+        assert!(reserve_ip(&mut counts, other, 2));
+        release_ip(&mut counts, ip.unwrap());
+        assert!(reserve_ip(&mut counts, ip, 2));
+        release_ip(&mut counts, ip.unwrap());
+        release_ip(&mut counts, ip.unwrap());
+        assert!(!counts.contains_key(&ip.unwrap()));
+    }
+
+    #[test]
+    fn unix_clients_do_not_consume_ip_quota() {
+        let mut counts = HashMap::new();
+        assert!(reserve_ip(&mut counts, None, 1));
+        assert!(counts.is_empty());
     }
 }

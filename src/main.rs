@@ -119,6 +119,12 @@ struct Args {
     ssh_max_clients: usize,
     #[arg(
         long,
+        default_value_t = 16,
+        help = "maximum concurrent SSH connections per source IP"
+    )]
+    ssh_max_clients_per_ip: usize,
+    #[arg(
+        long,
         default_value_t = 10_000,
         help = "delay, in milliseconds, between banner lines sent to each trapped ssh client"
     )]
@@ -260,6 +266,7 @@ fn run(args: &Args) -> Result<(), EndlesshFatalError> {
     let ssh_options = EndlesshOptions {
         banner_line_length: args.ssh_banner_line_length,
         max_clients: args.ssh_max_clients,
+        max_clients_per_ip: args.ssh_max_clients_per_ip,
         message_delay: Duration::from_millis(args.ssh_message_delay_ms),
         newline: NewLine::LF,
     };
