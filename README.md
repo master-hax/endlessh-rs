@@ -8,7 +8,7 @@ features:
 * works on all platforms supported by [mio](https://github.com/tokio-rs/mio), including Windows
 * completely single threaded
 * minimal allocation
-* listens on either TCP or unix sockets
+* listens on multiple TCP or Unix sockets, including IPv4 and IPv6
 * optional openmetrics/prometheus http server (in the same thread)
 
 ```
@@ -16,7 +16,8 @@ Usage: endlessh-rs.exe [OPTIONS]
 
 Options:
       --ssh-listen-address <SSH_LISTEN_ADDRESS>
-          address to accept ssh connections on, in the form "ip:<socketaddr>" or "unix:<socketpath>" [default: ip:0.0.0.0:2222]
+          repeatable SSH listen address (ip:<socketaddr> or unix:<socketpath>)
+          [default: ip:0.0.0.0:2222 ip:[::]:2222]
       --ssh-banner-line-length <SSH_BANNER_LINE_LENGTH>
           length, in bytes, of each randomly generated banner line sent to ssh clients [default: 32]
       --ssh-max-clients <SSH_MAX_CLIENTS>
@@ -32,6 +33,19 @@ Options:
   -V, --version
           Print version
 ```
+
+## IPv4 and IPv6 listeners
+
+By default, the SSH tarpit listens on `0.0.0.0:2222` and `[::]:2222`.
+The IPv6 socket uses `IPV6_V6ONLY` so both address families can share a port.
+Specify alternative listeners by repeating `--ssh-listen-address`:
+
+```sh
+endlessh-rs --ssh-listen-address ip:0.0.0.0:2222 \
+  --ssh-listen-address 'ip:[::]:2222'
+```
+
+All SSH listeners share the existing `--ssh-max-clients` connection limit.
 
 ## TODO
 
