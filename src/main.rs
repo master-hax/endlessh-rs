@@ -5,15 +5,18 @@
 
 use std::borrow::Cow;
 use std::io::ErrorKind::Interrupted;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
 use mio::net::TcpListener;
 use mio::{event, Events, Interest, Poll, Token};
+use socket2::{Domain, Protocol, Socket, Type};
 use std::time::{Duration, Instant};
 
-use endlessh::{AnyListener, EndlesshFatalError, EndlesshOptions, EndlesshServer, NewLine, Verbosity};
+use endlessh::{
+    AnyListener, EndlesshFatalError, EndlesshOptions, EndlesshServer, NewLine, Verbosity,
+};
 
 #[cfg(unix)]
 use endlessh::EndlesshStats;
@@ -46,7 +49,10 @@ impl std::str::FromStr for ListenerAddress {
         } else if let Some(path) = v.strip_prefix("unix:") {
             Ok(ListenerAddress::Unix(PathBuf::from(path)))
         } else {
-            Err("listener must be of the form \"disabled|ip:<socketaddr>|unix:<socketpath>\"".to_string())
+            Err(
+                "listener must be of the form \"disabled|ip:<socketaddr>|unix:<socketpath>\""
+                    .to_string(),
+            )
         }
     }
 }
@@ -77,7 +83,29 @@ impl ListenerAddress {
         let listener = match self {
             ListenerAddress::Disabled => return Ok(None),
             ListenerAddress::Ip(ip) => {
-                AnyListener::from(TcpListener::bind(*ip).map_err(|e| bind_error(purpose, e))?)
+                // Force IPv6-only sockets so 0.0.0.0:PORT and [::]:PORT
+                // can coexist on Linux regardless of net.ipv6.bindv6only.
+                let domain = if ip.is_ipv6() {
+                    Domain::IPV6
+                } else {
+                    Domain::IPV4
+                };
+                let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+                    .map_err(|e| bind_error(purpose, e))?;
+                if ip.is_ipv6() {
+                    socket
+                        .set_only_v6(true)
+                        .map_err(|e| bind_error(purpose, e))?;
+                }
+                socket
+                    .set_nonblocking(true)
+                    .map_err(|e| bind_error(purpose, e))?;
+                socket
+                    .bind(&(*ip).into())
+                    .map_err(|e| bind_error(purpose, e))?;
+                socket.listen(128).map_err(|e| bind_error(purpose, e))?;
+                let std_listener: std::net::TcpListener = socket.into();
+                AnyListener::from(TcpListener::from_std(std_listener))
             }
             #[cfg(unix)]
             ListenerAddress::Unix(path) => {
@@ -100,11 +128,11 @@ impl ListenerAddress {
 #[command(version, about, long_about = None)]
 struct Args {
     #[arg(
-        long,
-        default_value_t=ListenerAddress::Ip(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 2222))),
-        help = "address to accept ssh connections on, in the form \"ip:<socketaddr>\" or \"unix:<socketpath>\""
+        long = "ssh-listen-address",
+        default_values = ["ip:0.0.0.0:2222", "ip:[::]:2222"],
+        help = "SSH listen address, repeat for IPv4 and IPv6 (ip:<socketaddr> or unix:<socketpath>)"
     )]
-    ssh_listen_address: ListenerAddress,
+    ssh_listen_addresses: Vec<ListenerAddress>,
     #[arg(
         long,
         default_value_t = 32,
@@ -247,7 +275,13 @@ fn run(args: &Args) -> Result<(), EndlesshFatalError> {
     let events = Events::with_capacity(128);
 
     let mut token_counter = 0usize;
-    let ssh_server_token = next_token(&mut token_counter);
+    let mut ssh_listeners = Vec::with_capacity(args.ssh_listen_addresses.len());
+    for address in &args.ssh_listen_addresses {
+        let listener = address.bind("ssh")?.ok_or_else(|| {
+            EndlesshFatalError::InvalidOptions(Cow::Borrowed("ssh listener cannot be disabled"))
+        })?;
+        ssh_listeners.push((listener, next_token(&mut token_counter)));
+    }
 
     #[cfg(unix)]
     let signal_handler = SignalHandler::new(&poll, next_token(&mut token_counter))?;
@@ -264,13 +298,9 @@ fn run(args: &Args) -> Result<(), EndlesshFatalError> {
         newline: NewLine::LF,
     };
 
-    let ssh_listener = args.ssh_listen_address.bind("ssh")?.ok_or_else(|| {
-        EndlesshFatalError::InvalidOptions(Cow::Borrowed("ssh listener cannot be disabled"))
-    })?;
-    let endlessh_server = EndlesshServer::new(
+    let endlessh_server = EndlesshServer::with_listeners(
         ssh_options,
-        ssh_listener,
-        ssh_server_token,
+        ssh_listeners,
         &poll,
         Verbosity::from(args.verbose),
     )?;
@@ -306,5 +336,39 @@ fn main() {
     if let Err(e) = run(args) {
         eprintln!("endlessh-rs: {}", e);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_include_both_ip_families() {
+        let args = Args::try_parse_from(["endlessh-rs"]).unwrap();
+        assert_eq!(args.ssh_listen_addresses.len(), 2);
+        assert!(args
+            .ssh_listen_addresses
+            .iter()
+            .any(|address| matches!(address, ListenerAddress::Ip(SocketAddr::V4(_)))));
+        assert!(args
+            .ssh_listen_addresses
+            .iter()
+            .any(|address| matches!(address, ListenerAddress::Ip(SocketAddr::V6(_)))));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ipv4_and_ipv6_wildcards_can_share_a_port() {
+        let v4 = ListenerAddress::Ip("0.0.0.0:0".parse().unwrap())
+            .bind("test")
+            .unwrap()
+            .unwrap();
+        let port = match &v4 {
+            AnyListener::Tcp(listener) => listener.local_addr().unwrap().port(),
+            _ => panic!("expected TCP listener"),
+        };
+        let v6_addr = format!("[::]:{port}").parse().unwrap();
+        let _v6 = ListenerAddress::Ip(v6_addr).bind("test").unwrap().unwrap();
     }
 }
