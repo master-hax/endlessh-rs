@@ -8,6 +8,9 @@ readme = "README.md"
 repository = "https://github.com/master-hax/endlessh-rs.git"
 license = "MIT OR Apache-2.0"
 
+[profile.release]
+strip = "symbols"
+
 [lib]
 name = "endlessh"
 path = "src/lib.rs"

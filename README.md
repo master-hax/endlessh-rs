@@ -33,6 +33,52 @@ Options:
           Print version
 ```
 
+## Building
+
+### Standard release build
+
+To build a release binary without optional metrics:
+
+```sh
+cargo build --release --locked --no-default-features
+```
+
+### Static Linux build (x86_64)
+
+For deployment on compatible x86-64 Linux servers, build a statically
+linked binary using the musl target.
+
+Install the target once:
+
+```sh
+rustup target add x86_64-unknown-linux-musl
+```
+
+A compatible musl linker/toolchain must also be available on the build machine.
+
+Build the release binary without optional metrics:
+
+```sh
+cargo build --release --locked --no-default-features \
+  --target x86_64-unknown-linux-musl
+```
+
+The binary is written to:
+
+```text
+target/x86_64-unknown-linux-musl/release/endlessh-rs
+```
+
+Check its format:
+
+```sh
+file target/x86_64-unknown-linux-musl/release/endlessh-rs
+```
+
+On x86-64 Linux, the expected result is a **statically linked ELF executable**
+(typically `static-pie`). Release builds are automatically stripped of
+symbol information through `strip = "symbols"` in `Cargo.toml`.
+
 ## TODO
 
 - [ ] add logging?
