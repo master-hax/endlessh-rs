@@ -33,6 +33,31 @@ Options:
           Print version
 ```
 
+## systemd (Linux)
+
+An example service is available at [`systemd/endlessh-rs.service`](systemd/endlessh-rs.service).
+It runs as an unprivileged dynamic user with a restricted systemd environment.
+The service listens on IPv4 port 22 and uses the existing global limit of
+512 concurrent SSH connections. This configuration works without dual-stack
+or per-IP-limit support.
+
+Install a previously built binary and the service file:
+
+```sh
+sudo install -m 755 target/release/endlessh-rs /usr/local/bin/endlessh-rs
+sudo install -Dm 644 systemd/endlessh-rs.service /etc/systemd/system/endlessh-rs.service
+sudo systemctl daemon-reload
+```
+
+**Before enabling this service on port 22**, move OpenSSH to another port,
+open that port in the firewall, and confirm you can log in using a *new* SSH
+connection. If OpenSSH uses systemd socket activation, adjust its socket too.
+Keep your existing SSH session open during this change.
+
+Then start the tarpit with `sudo systemctl enable --now endlessh-rs`.
+To listen on IPv6 instead, change its single `--ssh-listen-address` argument
+to `ip:[::]:22` (this version supports one SSH listener at a time).
+
 ## TODO
 
 - [ ] add logging?
