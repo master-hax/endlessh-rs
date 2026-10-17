@@ -171,7 +171,24 @@ struct EndlesshConnection<Stream: MioStream> {
     stream: Stream,
     connected_time: Instant,
     last_send_time: Option<Instant>,
+    retry_after: Option<Instant>,
     bytes_sent: usize,
+}
+
+// Delay retries for SSH clients whose socket write would block.
+const BLOCKED_SEND_RETRY: Duration = Duration::from_millis(250);
+
+fn send_wait(
+    last_send_time: Option<Instant>,
+    retry_after: Option<Instant>,
+    now: Instant,
+    message_delay: Duration,
+) -> Duration {
+    let interval = last_send_time.map_or(Duration::ZERO, |last| {
+        (last + message_delay).saturating_duration_since(now)
+    });
+    let retry = retry_after.map_or(Duration::ZERO, |until| until.saturating_duration_since(now));
+    interval.max(retry)
 }
 
 impl<Listener: MioListener> EndlesshServer<Listener> {
@@ -227,41 +244,47 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
         assert!(*now >= self.stats.last_known_time, "time went backwards!");
         self.stats.last_known_time = *now;
         let mut generated_line = false;
-        while let Some(connection) = self.connections.pop_front() {
-            let send_or_wait: Option<Duration> = match connection.last_send_time {
-                None => {
-                    // connection has never received a line - send immediately
-                    None
-                }
-                Some(last_send) => {
-                    // connection has received a line before - send if the message window has elapsed
-                    (last_send + self.options.message_delay).checked_duration_since(*now)
-                }
-            };
+        // Handle each queued connection at most once per wakeup. A WouldBlock
+        // retry must not cycle back into the same wakeup and spin.
+        let queued = self.connections.len();
+        for _ in 0..queued {
+            let connection = self.connections.pop_front().unwrap();
+            let wait = send_wait(
+                connection.last_send_time,
+                connection.retry_after,
+                *now,
+                self.options.message_delay,
+            );
+            if !wait.is_zero() {
+                self.connections.push_back(connection);
+                continue;
+            }
 
-            match send_or_wait {
+            if !generated_line {
+                Self::rand_line(&mut self.line_buffer[..self.options.banner_line_length]);
+                self.stats.bytes_generated += self.options.banner_line_length;
+                generated_line = true;
+            }
+            match self.send_line(connection, now) {
+                Some(c) => self.connections.push_back(c),
                 None => {
-                    if !generated_line {
-                        Self::rand_line(&mut self.line_buffer[..self.options.banner_line_length]);
-                        self.stats.bytes_generated += self.options.banner_line_length;
-                        generated_line = true;
-                    }
-                    match self.send_line(connection, now) {
-                        Some(c) => self.connections.push_back(c),
-                        None => {
-                            // drop the connection
-                            self.stats.connections_closed += 1;
-                            self.accept_new_connections(now);
-                        }
-                    }
-                }
-                Some(need_to_wait) => {
-                    self.connections.push_back(connection);
-                    return Some(need_to_wait);
+                    self.stats.connections_closed += 1;
+                    self.accept_new_connections(now);
                 }
             }
         }
-        None
+
+        self.connections
+            .iter()
+            .map(|connection| {
+                send_wait(
+                    connection.last_send_time,
+                    connection.retry_after,
+                    *now,
+                    self.options.message_delay,
+                )
+            })
+            .min()
     }
 
     pub fn stats(&mut self) -> &EndlesshStats {
@@ -294,6 +317,7 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
                         stream,
                         connected_time: *now,
                         last_send_time: None,
+                        retry_after: None,
                         bytes_sent: 0,
                     });
                     self.stats.connections_opened += 1;
@@ -334,6 +358,7 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
             }
             Ok(n) => {
                 // send (at least partially) succeeded
+                connection.retry_after = None;
                 self.stats.bytes_sent += n;
                 connection.bytes_sent += n;
                 self.stats.trapped_time += now.duration_since(
@@ -346,7 +371,7 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
                 Some(connection)
             }
             Err(ref err) if err.kind() == ErrorKind::WouldBlock => {
-                // couldn't send - oh well
+                connection.retry_after = Some(*now + BLOCKED_SEND_RETRY);
                 Some(connection)
             }
             Err(_e) => {
@@ -377,5 +402,42 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
                 connection.bytes_sent
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod blocked_write_tests {
+    use super::*;
+
+    #[test]
+    fn blocked_write_schedules_retry_instead_of_spinning() {
+        let now = Instant::now();
+        let delay = Duration::from_secs(10);
+        let last_send = now - delay;
+        let retry_after = now + BLOCKED_SEND_RETRY;
+        assert_eq!(
+            send_wait(Some(last_send), Some(retry_after), now, delay),
+            BLOCKED_SEND_RETRY
+        );
+        assert_eq!(
+            send_wait(None, Some(retry_after), now, delay),
+            BLOCKED_SEND_RETRY
+        );
+        assert_eq!(
+            send_wait(Some(last_send), Some(retry_after), retry_after, delay),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn normal_banner_interval_is_preserved() {
+        let now = Instant::now();
+        let delay = Duration::from_secs(10);
+        assert_eq!(send_wait(Some(now), None, now, delay), delay);
+        assert_eq!(
+            send_wait(Some(now), Some(now + BLOCKED_SEND_RETRY), now, delay),
+            delay
+        );
+        assert_eq!(send_wait(None, None, now, delay), Duration::ZERO);
     }
 }
