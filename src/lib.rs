@@ -160,7 +160,9 @@ impl Display for EndlesshStats {
 
 pub struct EndlesshServer<Listener: MioListener> {
     listeners: Vec<ListenerEntry<Listener>>,
-    next_accept: usize,
+    first_listener_token: usize,
+    ready_listeners: VecDeque<usize>,
+    retry_listeners: VecDeque<(Instant, usize)>,
     line_buffer: [u8; SSH_LINE_BUFFER_SIZE],
     connections: VecDeque<EndlesshConnection<Listener::Stream>>,
     stats: EndlesshStats,
@@ -170,7 +172,6 @@ pub struct EndlesshServer<Listener: MioListener> {
 
 struct ListenerEntry<Listener: MioListener> {
     listener: Listener,
-    token: Token,
     accept_available: bool,
 }
 
@@ -183,8 +184,9 @@ struct EndlesshConnection<Stream: MioStream> {
 
 // Limit each accept burst to keep signals and periodic banner writes
 // responsive during connection floods.
+const MAX_SSH_LISTENERS: usize = 64;
 const MAX_ACCEPTS_PER_TICK: usize = 128;
-const PENDING_ACCEPT_RETRY: Duration = Duration::from_millis(20);
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(20);
 
 impl<Listener: MioListener> EndlesshServer<Listener> {
     /// Backwards-compatible constructor for a single listener.
@@ -205,9 +207,21 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
         poll: &Poll,
         verbosity: Verbosity,
     ) -> Result<Self, EndlesshFatalError> {
-        if listeners.is_empty() {
+        if listeners.is_empty() || listeners.len() > MAX_SSH_LISTENERS {
+            return Err(EndlesshFatalError::InvalidOptions(Cow::Owned(format!(
+                "ssh listener count must be between 1 and {MAX_SSH_LISTENERS}",
+            ))));
+        }
+        // Tokens are consecutive, enabling direct event-to-listener indexing.
+        // A single-listener server may still use any token value.
+        let first_listener_token = listeners[0].1 .0;
+        if listeners
+            .iter()
+            .enumerate()
+            .any(|(index, (_, token))| first_listener_token.checked_add(index) != Some(token.0))
+        {
             return Err(EndlesshFatalError::InvalidOptions(Cow::Borrowed(
-                "at least one ssh listener is required",
+                "listener tokens must be consecutive",
             )));
         }
         if options.max_clients == 0 {
@@ -232,28 +246,23 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
             .copy_from_slice(options.newline.get_data());
         let connections = VecDeque::with_capacity(options.max_clients);
         let mut listener_entries = Vec::with_capacity(listeners.len());
+        let ready_listeners = VecDeque::with_capacity(listeners.len());
+        let retry_listeners = VecDeque::with_capacity(listeners.len());
 
         for (mut listener, token) in listeners {
-            if listener_entries
-                .iter()
-                .any(|entry: &ListenerEntry<Listener>| entry.token == token)
-            {
-                return Err(EndlesshFatalError::InvalidOptions(Cow::Borrowed(
-                    "listener tokens must be distinct",
-                )));
-            }
             poll.registry()
                 .register(&mut listener, token, Interest::READABLE)?;
             listener_entries.push(ListenerEntry {
                 listener,
-                token,
                 accept_available: false,
             });
         }
 
         Ok(EndlesshServer {
             listeners: listener_entries,
-            next_accept: 0,
+            first_listener_token,
+            ready_listeners,
+            retry_listeners,
             line_buffer,
             connections,
             stats: EndlesshStats::default(),
@@ -266,12 +275,17 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
     pub fn try_handle_event(&mut self, event: &event::Event, now: &Instant) -> bool {
         assert!(*now >= self.stats.last_known_time, "time went backwards!");
         self.stats.last_known_time = *now;
-        if let Some(entry) = self
-            .listeners
-            .iter_mut()
-            .find(|entry| entry.token == event.token())
+        if let Some(index) = event
+            .token()
+            .0
+            .checked_sub(self.first_listener_token)
+            .filter(|&index| index < self.listeners.len())
         {
-            entry.accept_available = true;
+            // Queue each ready listener once; token lookup stays O(1).
+            if !self.listeners[index].accept_available {
+                self.listeners[index].accept_available = true;
+                self.ready_listeners.push_back(index);
+            }
             self.accept_new_connections(now);
             true
         } else {
@@ -297,7 +311,6 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
             let send_or_wait = connection.last_send_time.and_then(|last_send| {
                 (last_send + self.options.message_delay).checked_duration_since(*now)
             });
-
             if send_or_wait.is_some() {
                 self.connections.push_back(connection);
                 continue;
@@ -323,24 +336,36 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
             .map(|connection| {
                 connection
                     .last_send_time
-                    .map_or(PENDING_ACCEPT_RETRY, |last_send| {
+                    .map_or(ACCEPT_RETRY_DELAY, |last_send| {
                         (last_send + self.options.message_delay).saturating_duration_since(*now)
                     })
             })
             .min();
-        self.next_timeout(next_banner)
+        self.next_timeout(next_banner, now)
     }
 
     fn has_pending_accepts(&self) -> bool {
         self.connections.len() < self.options.max_clients
-            && self.listeners.iter().any(|entry| entry.accept_available)
+            && (!self.ready_listeners.is_empty() || !self.retry_listeners.is_empty())
     }
 
-    fn next_timeout(&self, banner_wait: Option<Duration>) -> Option<Duration> {
-        if self.has_pending_accepts() {
-            Some(banner_wait.map_or(PENDING_ACCEPT_RETRY, |wait| wait.min(PENDING_ACCEPT_RETRY)))
+    fn next_timeout(&self, banner_wait: Option<Duration>, now: &Instant) -> Option<Duration> {
+        if !self.has_pending_accepts() {
+            return banner_wait;
+        }
+        let mut accept_wait = if self.ready_listeners.is_empty() {
+            None
         } else {
-            banner_wait
+            Some(ACCEPT_RETRY_DELAY)
+        };
+        if let Some(&(retry_at, _)) = self.retry_listeners.front() {
+            let delay = retry_at.saturating_duration_since(*now);
+            accept_wait = Some(accept_wait.map_or(delay, |wait| wait.min(delay)));
+        }
+        match (banner_wait, accept_wait) {
+            (Some(banner), Some(accept)) => Some(banner.min(accept)),
+            (Some(wait), None) | (None, Some(wait)) => Some(wait),
+            (None, None) => None,
         }
     }
 
@@ -349,59 +374,66 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
     }
 
     fn accept_new_connections(&mut self, now: &Instant) {
-        // Alternate ready listeners so a busy IPv4 source cannot starve IPv6 (or vice versa).
-        let mut attempts = 0;
-        while self.connections.len() < self.options.max_clients && attempts < MAX_ACCEPTS_PER_TICK {
-            let mut accepted = false;
-            let listener_count = self.listeners.len();
-            for offset in 0..listener_count {
-                let index = (self.next_accept + offset) % listener_count;
-                if !self.listeners[index].accept_available {
-                    continue;
-                }
-                match self.listeners[index].listener.accept_stream() {
-                    Ok(stream) => {
-                        attempts += 1;
-                        accepted = true;
-                        self.next_accept = (index + 1) % listener_count;
-                        stream.shrink_receive_buffer();
-                        if self.verbosity >= Verbosity::Info {
-                            println!(
-                                "{} ACCEPT host={}{}{} n={}/{}",
-                                log_timestamp(),
-                                stream.host_description(),
-                                stream
-                                    .port()
-                                    .map(|port| format!(" port={port}"))
-                                    .unwrap_or_default(),
-                                stream
-                                    .raw_fd()
-                                    .map(|fd| format!(" fd={fd}"))
-                                    .unwrap_or_default(),
-                                self.connections.len() + 1,
-                                self.options.max_clients
-                            );
-                        }
-                        self.connections.push_back(EndlesshConnection {
-                            stream,
-                            connected_time: *now,
-                            last_send_time: None,
-                            bytes_sent: 0,
-                        });
-                        self.stats.connections_opened += 1;
-                        break;
-                    }
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                        self.listeners[index].accept_available = false;
-                    }
-                    Err(e) => {
-                        eprintln!("failed to accept ssh connection: {}", e);
-                        self.listeners[index].accept_available = false;
-                    }
-                }
-            }
-            if !accepted {
+        // Bring back listeners whose transient accept errors have cooled down.
+        while let Some(&(retry_at, index)) = self.retry_listeners.front() {
+            if retry_at > *now {
                 break;
+            }
+            self.retry_listeners.pop_front();
+            self.ready_listeners.push_back(index);
+        }
+
+        // Round-robin over ready listeners without scanning inactive listeners.
+        let mut accepted_count = 0;
+        while self.connections.len() < self.options.max_clients
+            && accepted_count < MAX_ACCEPTS_PER_TICK
+        {
+            let Some(index) = self.ready_listeners.pop_front() else {
+                break;
+            };
+
+            match self.listeners[index].listener.accept_stream() {
+                Ok(stream) => {
+                    accepted_count += 1;
+                    // Leave this listener ready until accept() reports WouldBlock.
+                    // Requeue it at the back to give other listeners a turn.
+                    self.ready_listeners.push_back(index);
+                    stream.shrink_receive_buffer();
+                    if self.verbosity >= Verbosity::Info {
+                        println!(
+                            "{} ACCEPT host={}{}{} n={}/{}",
+                            log_timestamp(),
+                            stream.host_description(),
+                            stream
+                                .port()
+                                .map(|port| format!(" port={port}"))
+                                .unwrap_or_default(),
+                            stream
+                                .raw_fd()
+                                .map(|fd| format!(" fd={fd}"))
+                                .unwrap_or_default(),
+                            self.connections.len() + 1,
+                            self.options.max_clients
+                        );
+                    }
+                    self.connections.push_back(EndlesshConnection {
+                        stream,
+                        connected_time: *now,
+                        last_send_time: None,
+                        bytes_sent: 0,
+                    });
+                    self.stats.connections_opened += 1;
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    self.listeners[index].accept_available = false;
+                }
+                Err(e) => {
+                    eprintln!("failed to accept ssh connection: {}", e);
+                    // Preserve readiness on transient errors. Delay retries to
+                    // avoid spinning on repeated accept() failures.
+                    self.retry_listeners
+                        .push_back((*now + ACCEPT_RETRY_DELAY, index));
+                }
             }
         }
     }
@@ -469,4 +501,3 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
         }
     }
 }
-

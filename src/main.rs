@@ -10,7 +10,9 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use mio::net::TcpListener;
-use mio::{event, Events, Interest, Poll, Token};
+#[cfg(unix)]
+use mio::{event, Interest};
+use mio::{Events, Poll, Token};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::time::{Duration, Instant};
 
@@ -83,29 +85,9 @@ impl ListenerAddress {
         let listener = match self {
             ListenerAddress::Disabled => return Ok(None),
             ListenerAddress::Ip(ip) => {
-                // Force IPv6-only sockets so 0.0.0.0:PORT and [::]:PORT
-                // can coexist on Linux regardless of net.ipv6.bindv6only.
-                let domain = if ip.is_ipv6() {
-                    Domain::IPV6
-                } else {
-                    Domain::IPV4
-                };
-                let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
-                    .map_err(|e| bind_error(purpose, e))?;
-                if ip.is_ipv6() {
-                    socket
-                        .set_only_v6(true)
-                        .map_err(|e| bind_error(purpose, e))?;
-                }
-                socket
-                    .set_nonblocking(true)
-                    .map_err(|e| bind_error(purpose, e))?;
-                socket
-                    .bind(&(*ip).into())
-                    .map_err(|e| bind_error(purpose, e))?;
-                socket.listen(128).map_err(|e| bind_error(purpose, e))?;
-                let std_listener: std::net::TcpListener = socket.into();
-                AnyListener::from(TcpListener::from_std(std_listener))
+                // Explicit IPv6 listeners remain IPv6-only, allowing a
+                // separate IPv4 listener to bind the same port.
+                bind_ip_listener(*ip, true).map_err(|e| bind_error(purpose, e))?
             }
             #[cfg(unix)]
             ListenerAddress::Unix(path) => {
@@ -129,8 +111,7 @@ impl ListenerAddress {
 struct Args {
     #[arg(
         long = "ssh-listen-address",
-        default_values = ["ip:0.0.0.0:2222", "ip:[::]:2222"],
-        help = "SSH listen address, repeat for IPv4 and IPv6 (ip:<socketaddr> or unix:<socketpath>)"
+        help = "Repeatable SSH listen address (ip:<socketaddr> or unix:<socketpath>); default: dual-stack [::]:2222"
     )]
     ssh_listen_addresses: Vec<ListenerAddress>,
     #[arg(
@@ -275,12 +256,28 @@ fn run(args: &Args) -> Result<(), EndlesshFatalError> {
     let events = Events::with_capacity(128);
 
     let mut token_counter = 0usize;
-    let mut ssh_listeners = Vec::with_capacity(args.ssh_listen_addresses.len());
-    for address in &args.ssh_listen_addresses {
-        let listener = address.bind("ssh")?.ok_or_else(|| {
-            EndlesshFatalError::InvalidOptions(Cow::Borrowed("ssh listener cannot be disabled"))
-        })?;
+    let mut ssh_listeners = Vec::with_capacity(args.ssh_listen_addresses.len().max(1));
+    if args.ssh_listen_addresses.is_empty() {
+        // Default to one IPv6 socket accepting IPv4-mapped and native IPv6.
+        // Retain IPv4-only operation when IPv6 is unavailable.
+        let address: SocketAddr = "[::]:2222".parse().unwrap();
+        let listener = match bind_ip_listener(address, false) {
+            Ok(listener) => listener,
+            Err(error) if ipv6_unavailable(&error) => {
+                eprintln!("IPv6 unavailable ({error}); trying IPv4-only");
+                bind_ip_listener("0.0.0.0:2222".parse().unwrap(), true)
+                    .map_err(|error| bind_error("ssh", error))?
+            }
+            Err(error) => return Err(bind_error("ssh", error)),
+        };
         ssh_listeners.push((listener, next_token(&mut token_counter)));
+    } else {
+        for address in &args.ssh_listen_addresses {
+            let listener = address.bind("ssh")?.ok_or_else(|| {
+                EndlesshFatalError::InvalidOptions(Cow::Borrowed("ssh listener cannot be disabled"))
+            })?;
+            ssh_listeners.push((listener, next_token(&mut token_counter)));
+        }
     }
 
     #[cfg(unix)]
@@ -339,22 +336,101 @@ fn main() {
     }
 }
 
+fn bind_ip_listener(ip: SocketAddr, ipv6_only: bool) -> std::io::Result<AnyListener> {
+    let domain = if ip.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    if ip.is_ipv6() {
+        socket.set_only_v6(ipv6_only)?;
+    }
+    socket.set_nonblocking(true)?;
+    socket.bind(&ip.into())?;
+    socket.listen(128)?;
+    let std_listener: std::net::TcpListener = socket.into();
+    Ok(AnyListener::from(TcpListener::from_std(std_listener)))
+}
+
+// Only use the IPv4 fallback when IPv6 or dual-stack sockets are unavailable.
+// The raw OS codes cover unsupported address families, protocols and socket options.
+fn ipv6_unavailable(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+
+    if matches!(
+        error.kind(),
+        ErrorKind::Unsupported | ErrorKind::AddrNotAvailable
+    ) {
+        return true;
+    }
+
+    match error.raw_os_error() {
+        #[cfg(target_os = "linux")]
+        Some(97 | 93 | 92) => true, // EAFNOSUPPORT, EPROTONOSUPPORT, ENOPROTOOPT
+        #[cfg(target_os = "windows")]
+        Some(10047 | 10043 | 10042) => true, // WSAEAFNOSUPPORT, WSAEPROTONOSUPPORT, WSAENOPROTOOPT
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        ))]
+        Some(47 | 43 | 42) => true, // EAFNOSUPPORT, EPROTONOSUPPORT, ENOPROTOOPT
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn defaults_include_both_ip_families() {
+    fn fallback_only_for_unavailable_ipv6() {
+        use std::io::{Error, ErrorKind};
+
+        assert!(ipv6_unavailable(&Error::from(ErrorKind::Unsupported)));
+        assert!(ipv6_unavailable(&Error::from(ErrorKind::AddrNotAvailable)));
+        assert!(!ipv6_unavailable(&Error::from(ErrorKind::AddrInUse)));
+        assert!(!ipv6_unavailable(&Error::from(ErrorKind::PermissionDenied)));
+
+        #[cfg(target_os = "linux")]
+        assert!(ipv6_unavailable(&Error::from_raw_os_error(97)));
+        #[cfg(target_os = "windows")]
+        assert!(ipv6_unavailable(&Error::from_raw_os_error(10047)));
+    }
+
+    #[test]
+    fn default_uses_implicit_dual_stack() {
         let args = Args::try_parse_from(["endlessh-rs"]).unwrap();
+        assert!(args.ssh_listen_addresses.is_empty());
+    }
+
+    #[test]
+    fn explicit_listeners_are_repeatable() {
+        let args = Args::try_parse_from([
+            "endlessh-rs",
+            "--ssh-listen-address",
+            "ip:127.0.0.1:2222",
+            "--ssh-listen-address",
+            "ip:[::1]:2222",
+        ])
+        .unwrap();
         assert_eq!(args.ssh_listen_addresses.len(), 2);
-        assert!(args
-            .ssh_listen_addresses
-            .iter()
-            .any(|address| matches!(address, ListenerAddress::Ip(SocketAddr::V4(_)))));
-        assert!(args
-            .ssh_listen_addresses
-            .iter()
-            .any(|address| matches!(address, ListenerAddress::Ip(SocketAddr::V6(_)))));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn one_dual_stack_socket_accepts_ipv4_and_ipv6() {
+        let listener = bind_ip_listener("[::]:0".parse().unwrap(), false).unwrap();
+        let port = match &listener {
+            AnyListener::Tcp(listener) => listener.local_addr().unwrap().port(),
+            #[cfg(unix)]
+            _ => panic!("expected TCP listener"),
+        };
+        let _ipv4 = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let _ipv6 = std::net::TcpStream::connect(("::1", port)).unwrap();
     }
 
     #[cfg(target_os = "linux")]

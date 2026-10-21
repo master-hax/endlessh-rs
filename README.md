@@ -17,7 +17,7 @@ Usage: endlessh-rs.exe [OPTIONS]
 Options:
       --ssh-listen-address <SSH_LISTEN_ADDRESS>
           repeatable SSH listen address (ip:<socketaddr> or unix:<socketpath>)
-          [default: ip:0.0.0.0:2222 ip:[::]:2222]
+          [default: one dual-stack socket on [::]:2222; IPv4 fallback]
       --ssh-banner-line-length <SSH_BANNER_LINE_LENGTH>
           length, in bytes, of each randomly generated banner line sent to ssh clients [default: 32]
       --ssh-max-clients <SSH_MAX_CLIENTS>
@@ -36,9 +36,12 @@ Options:
 
 ## IPv4 and IPv6 listeners
 
-By default, the SSH tarpit listens on `0.0.0.0:2222` and `[::]:2222`.
-The IPv6 socket uses `IPV6_V6ONLY` so both address families can share a port.
-Specify alternative listeners by repeating `--ssh-listen-address`:
+By default, the SSH tarpit uses one dual-stack IPv6 listener on `[::]:2222`
+(with `IPV6_V6ONLY` disabled), accepting IPv4 and IPv6 connections. If IPv6
+cannot be bound, it tries an IPv4-only listener on `0.0.0.0:2222`.
+Explicitly configured IPv6 listeners use `IPV6_V6ONLY`, allowing separate
+IPv4 listeners on the same port. Configure multiple listeners by repeating
+`--ssh-listen-address`:
 
 ```sh
 endlessh-rs --ssh-listen-address ip:0.0.0.0:2222 \
