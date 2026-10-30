@@ -28,8 +28,10 @@ fn log_timestamp() -> LogTimestamp {
     let since_epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    let duration =
-        jiff::SignedDuration::new(since_epoch.as_secs() as i64, since_epoch.subsec_nanos() as i32);
+    let duration = jiff::SignedDuration::new(
+        since_epoch.as_secs() as i64,
+        since_epoch.subsec_nanos() as i32,
+    );
     LogTimestamp(jiff::Timestamp::from_duration(duration).unwrap_or(jiff::Timestamp::UNIX_EPOCH))
 }
 
@@ -458,7 +460,10 @@ mod tests {
         let poll = Poll::new().unwrap();
         let message_delay = Duration::from_secs(10);
         let mut server = EndlesshServer::new(
-            EndlesshOptions { message_delay, ..Default::default() },
+            EndlesshOptions {
+                message_delay,
+                ..Default::default()
+            },
             NoAcceptListener,
             Token(0),
             &poll,
@@ -470,7 +475,9 @@ mod tests {
         let now = Instant::now();
         for _ in 0..5 {
             server.connections.push_back(EndlesshConnection {
-                stream: BlockedStream { write_attempts: write_attempts.clone() },
+                stream: BlockedStream {
+                    write_attempts: write_attempts.clone(),
+                },
                 connected_time: now,
                 last_send_time: None,
                 bytes_sent: 0,
@@ -555,7 +562,10 @@ mod tests {
         let poll = Poll::new().unwrap();
         let max_clients = 50;
         let mut server = EndlesshServer::new(
-            EndlesshOptions { max_clients, ..Default::default() },
+            EndlesshOptions {
+                max_clients,
+                ..Default::default()
+            },
             InfiniteAcceptListener,
             Token(0),
             &poll,

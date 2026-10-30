@@ -13,7 +13,9 @@ use mio::net::TcpListener;
 use mio::{Events, Poll, Token};
 use std::time::{Duration, Instant};
 
-use endlessh::{AnyListener, EndlesshFatalError, EndlesshOptions, EndlesshServer, NewLine, Verbosity};
+use endlessh::{
+    AnyListener, EndlesshFatalError, EndlesshOptions, EndlesshServer, NewLine, Verbosity,
+};
 
 #[cfg(any(feature = "metrics", unix))]
 use endlessh::EndlesshStats;
@@ -48,7 +50,10 @@ impl std::str::FromStr for ListenerAddress {
         } else if let Some(path) = v.strip_prefix("unix:") {
             Ok(ListenerAddress::Unix(PathBuf::from(path)))
         } else {
-            Err("listener must be of the form \"disabled|ip:<socketaddr>|unix:<socketpath>\"".to_string())
+            Err(
+                "listener must be of the form \"disabled|ip:<socketaddr>|unix:<socketpath>\""
+                    .to_string(),
+            )
         }
     }
 }
@@ -179,7 +184,12 @@ impl std::fmt::Display for MetricsSnapshot<'_> {
 #[cfg(all(not(feature = "metrics"), unix))]
 impl std::fmt::Display for MetricsSnapshot<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "endlessh_uptime_seconds: {}\n{}", self.uptime.as_secs(), self.ssh)
+        write!(
+            f,
+            "endlessh_uptime_seconds: {}\n{}",
+            self.uptime.as_secs(),
+            self.ssh
+        )
     }
 }
 
@@ -230,7 +240,10 @@ fn event_loop(
                             .map(|s| s.stats())
                             .unwrap_or(&disabled_ssh_stats),
                         #[cfg(feature = "metrics")]
-                        metrics: metric_server.as_mut().map(|m| m.stats()).unwrap_or_default(),
+                        metrics: metric_server
+                            .as_mut()
+                            .map(|m| m.stats())
+                            .unwrap_or_default(),
                     };
                     signal_handler.try_handle_event(event, &snapshot)
                 } =>

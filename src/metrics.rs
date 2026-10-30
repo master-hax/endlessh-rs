@@ -153,9 +153,9 @@ impl<Listener: MioListener> MetricServer<Listener> {
                         .pop_front()
                         .expect("available connections is empty");
 
-                    if let Err(e) =
-                        poll.registry()
-                            .register(&mut stream, token, Interest::READABLE)
+                    if let Err(e) = poll
+                        .registry()
+                        .register(&mut stream, token, Interest::READABLE)
                     {
                         eprintln!("failed to register metrics client: {}", e);
                         self.available_connections.push_back(token);
@@ -203,9 +203,9 @@ impl<Listener: MioListener> MetricServer<Listener> {
         mut client: HttpClient<Listener::Stream>,
         response: Cow<'static, [u8]>,
     ) -> Option<HttpClient<Listener::Stream>> {
-        if let Err(e) =
-            poll.registry()
-                .reregister(&mut client.stream, *token, Interest::WRITABLE)
+        if let Err(e) = poll
+            .registry()
+            .reregister(&mut client.stream, *token, Interest::WRITABLE)
         {
             eprintln!("failed to reregister metrics client: {}", e);
             return Self::close(poll, client);
@@ -236,29 +236,28 @@ impl<Listener: MioListener> MetricServer<Listener> {
                 let request_too_big = *current_position >= request_buffer.len();
                 let mut headers = [httparse::EMPTY_HEADER; METRIC_HTTP_MAX_HEADERS];
                 let mut request_parser = Request::new(&mut headers);
-                let response: Cow<'static, [u8]> = match request_parser
-                    .parse(&request_buffer[..*current_position])
-                {
-                    // request too big for our buffer, or has too many header fields
-                    Ok(Status::Partial) if request_too_big => {
-                        Cow::Borrowed(HTTP_431_RESPONSE.as_bytes())
-                    }
-                    Err(httparse::Error::TooManyHeaders) => {
-                        Cow::Borrowed(HTTP_431_RESPONSE.as_bytes())
-                    }
-                    Ok(Status::Partial) => return Some(client),
-                    Err(_e) => return Self::close(poll, client),
-                    // http request has completed
-                    Ok(Status::Complete(_)) => match request_parser.path {
-                        Some("/metrics") => match request_parser.method {
-                            Some("GET") => {
-                                Cow::Owned(generate_http_response(http_response_body).into_bytes())
-                            }
-                            _ => Cow::Borrowed(HTTP_405_RESPONSE.as_bytes()),
+                let response: Cow<'static, [u8]> =
+                    match request_parser.parse(&request_buffer[..*current_position]) {
+                        // request too big for our buffer, or has too many header fields
+                        Ok(Status::Partial) if request_too_big => {
+                            Cow::Borrowed(HTTP_431_RESPONSE.as_bytes())
+                        }
+                        Err(httparse::Error::TooManyHeaders) => {
+                            Cow::Borrowed(HTTP_431_RESPONSE.as_bytes())
+                        }
+                        Ok(Status::Partial) => return Some(client),
+                        Err(_e) => return Self::close(poll, client),
+                        // http request has completed
+                        Ok(Status::Complete(_)) => match request_parser.path {
+                            Some("/metrics") => match request_parser.method {
+                                Some("GET") => Cow::Owned(
+                                    generate_http_response(http_response_body).into_bytes(),
+                                ),
+                                _ => Cow::Borrowed(HTTP_405_RESPONSE.as_bytes()),
+                            },
+                            _ => Cow::Borrowed(HTTP_404_RESPONSE.as_bytes()),
                         },
-                        _ => Cow::Borrowed(HTTP_404_RESPONSE.as_bytes()),
-                    },
-                };
+                    };
                 self.stats.requests_served += 1;
                 Self::respond(poll, token, client, response)
             }
