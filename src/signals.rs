@@ -11,10 +11,15 @@ pub struct SignalHandler {
     token: Token,
     signals: Signals,
     should_terminate: bool,
+    program_name: &'static str,
 }
 
 impl SignalHandler {
-    pub fn new(poll: &Poll, token: Token) -> Result<Self, EndlesshFatalError> {
+    pub fn new(
+        poll: &Poll,
+        token: Token,
+        program_name: &'static str,
+    ) -> Result<Self, EndlesshFatalError> {
         let mut signals = Signals::new(Signal::Terminate | Signal::Interrupt | Signal::User1)?;
         poll.registry()
             .register(&mut signals, token, Interest::READABLE)?;
@@ -22,6 +27,7 @@ impl SignalHandler {
             token,
             signals,
             should_terminate: false,
+            program_name,
         })
     }
 
@@ -36,12 +42,18 @@ impl SignalHandler {
         loop {
             match self.signals.receive() {
                 Ok(Some(Signal::Terminate)) => {
-                    eprintln!("endlessh-rs: received SIGTERM, shutting down\n{}", stats);
+                    eprintln!(
+                        "{}: received SIGTERM, shutting down\n{}",
+                        self.program_name, stats
+                    );
                     self.should_terminate = true;
                     return true;
                 }
                 Ok(Some(Signal::Interrupt)) => {
-                    eprintln!("endlessh-rs: received SIGINT, shutting down\n{}", stats);
+                    eprintln!(
+                        "{}: received SIGINT, shutting down\n{}",
+                        self.program_name, stats
+                    );
                     self.should_terminate = true;
                     return true;
                 }

@@ -29,6 +29,8 @@ use endlessh::signals::SignalHandler;
 #[cfg(feature = "metrics")]
 use endlessh::metrics::{MetricServer, MetricsStats};
 
+const PROGRAM_NAME: &str = env!("CARGO_BIN_NAME");
+
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum ListenerAddress {
     Ip(SocketAddr),
@@ -96,7 +98,10 @@ impl ListenerAddress {
                 )))
             }
         };
-        eprintln!("endlessh-rs listening for {purpose} connections on {self}");
+        eprintln!(
+            "{} listening for {} connections on {}",
+            PROGRAM_NAME, purpose, self
+        );
         Ok(Some(listener))
     }
 }
@@ -271,7 +276,7 @@ fn run(args: &Args) -> Result<(), EndlesshFatalError> {
     let ssh_server_token = next_token(&mut token_counter);
 
     #[cfg(unix)]
-    let signal_handler = SignalHandler::new(&poll, next_token(&mut token_counter))?;
+    let signal_handler = SignalHandler::new(&poll, next_token(&mut token_counter), PROGRAM_NAME)?;
 
     #[cfg(feature = "metrics")]
     let metric_server_token = next_token(&mut token_counter);
@@ -343,7 +348,7 @@ fn run(args: &Args) -> Result<(), EndlesshFatalError> {
 fn main() {
     let args = &Args::parse();
     if let Err(e) = run(args) {
-        eprintln!("endlessh-rs: {}", e);
+        eprintln!("{}: {}", PROGRAM_NAME, e);
         std::process::exit(1);
     }
 }
