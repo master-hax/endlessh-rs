@@ -12,11 +12,13 @@ features:
 * optional openmetrics/prometheus http server (in the same thread)
 
 ```
-Usage: endlessh-rs.exe [OPTIONS]
+an ssh tarpit inspired by endlessh, with optional prometheus metrics
+
+Usage: endlessh-rs[.exe] [OPTIONS]
 
 Options:
       --ssh-listen-address <SSH_LISTEN_ADDRESS>
-          address to accept ssh connections on, in the form "ip:<socketaddr>" or "unix:<socketpath>" [default: ip:0.0.0.0:2222]
+          address to accept ssh connections on, in the form "disabled", "ip:<socketaddr>", or "unix:<socketpath>" [default: ip:0.0.0.0:2222]
       --ssh-banner-line-length <SSH_BANNER_LINE_LENGTH>
           length, in bytes, of each randomly generated banner line sent to ssh clients [default: 32]
       --ssh-max-clients <SSH_MAX_CLIENTS>
@@ -27,6 +29,8 @@ Options:
           address to serve openmetrics/prometheus stats on, in the form "disabled", "ip:<socketaddr>", or "unix:<socketpath>" [default: disabled]
       --metrics-max-clients <METRICS_MAX_CLIENTS>
           maximum number of concurrent metrics http clients to serve at once [default: 3]
+  -v, --verbose...
+          increase logging verbosity (-v logs each connection, -vv for debug)
   -h, --help
           Print help
   -V, --version
@@ -81,7 +85,5 @@ symbol information through `strip = "symbols"` in `Cargo.toml`.
 
 ## TODO
 
-- [ ] add logging?
 - [ ] support detailed client metrics
-- [ ] add signals support
 - [ ] add comparison between implementations
