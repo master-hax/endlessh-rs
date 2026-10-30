@@ -14,6 +14,9 @@ pub use listener::{AnyListener, HostDescription, MioListener, MioStream};
 #[cfg(feature = "metrics")]
 pub mod metrics;
 
+#[cfg(unix)]
+pub mod signals;
+
 const SSH_LINE_BUFFER_SIZE: usize = 256;
 
 struct LogTimestamp(jiff::Timestamp);

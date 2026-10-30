@@ -24,9 +24,7 @@ use endlessh::EndlesshStats;
 use {mio::net::UnixListener, std::fs::remove_file};
 
 #[cfg(unix)]
-mod signals;
-#[cfg(unix)]
-use signals::SignalHandler;
+use endlessh::signals::SignalHandler;
 
 #[cfg(feature = "metrics")]
 use endlessh::metrics::{MetricServer, MetricsStats};

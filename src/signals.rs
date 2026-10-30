@@ -5,7 +5,7 @@ use std::fmt::Display;
 use mio::{event, Interest, Poll, Token};
 use mio_signals::{Signal, Signals};
 
-use endlessh::EndlesshFatalError;
+use crate::EndlesshFatalError;
 
 pub struct SignalHandler {
     token: Token,
