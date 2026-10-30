@@ -33,6 +33,35 @@ struct HttpClient<Stream: MioStream> {
     connection_status: MetricRequestStatus,
 }
 
+#[derive(Clone, Copy, Default)]
+pub struct MetricsStats {
+    pub connections_opened: usize,
+    pub connections_closed: usize,
+    pub requests_served: usize,
+    pub bytes_received: usize,
+    pub bytes_sent: usize,
+}
+
+impl std::fmt::Display for MetricsStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            concat!(
+                "endlessh_metrics_connections_opened: {}\n",
+                "endlessh_metrics_connections_closed: {}\n",
+                "endlessh_metrics_requests_served: {}\n",
+                "endlessh_metrics_bytes_received: {}\n",
+                "endlessh_metrics_bytes_sent: {}\n",
+            ),
+            self.connections_opened,
+            self.connections_closed,
+            self.requests_served,
+            self.bytes_received,
+            self.bytes_sent,
+        )
+    }
+}
+
 fn generate_http_response(to_body: &impl ToString) -> String {
     let body = to_body.to_string();
     format!(
@@ -53,6 +82,7 @@ pub struct MetricServer<Listener: MioListener> {
     listener_accept_available: bool,
     available_connections: VecDeque<Token>,
     current_connections: HashMap<Token, HttpClient<Listener::Stream>>,
+    stats: MetricsStats,
 }
 
 impl<Listener: MioListener> MetricServer<Listener> {
@@ -74,7 +104,12 @@ impl<Listener: MioListener> MetricServer<Listener> {
             listener_accept_available: false,
             available_connections,
             current_connections: HashMap::with_capacity(num_available),
+            stats: MetricsStats::default(),
         })
+    }
+
+    pub fn stats(&self) -> MetricsStats {
+        self.stats
     }
 
     pub fn try_handle_event(
@@ -97,6 +132,7 @@ impl<Listener: MioListener> MetricServer<Listener> {
                     .is_none());
             } else {
                 self.available_connections.push_back(client_token);
+                self.stats.connections_closed += 1;
             }
             // in case the number of clients dropped from the max
             self.try_accept_new_connections(poll);
@@ -134,6 +170,7 @@ impl<Listener: MioListener> MetricServer<Listener> {
                     };
 
                     self.current_connections.insert(token, new_client);
+                    self.stats.connections_opened += 1;
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
                     self.listener_accept_available = false;
@@ -178,7 +215,7 @@ impl<Listener: MioListener> MetricServer<Listener> {
     }
 
     fn handle_client(
-        &self,
+        &mut self,
         poll: &mut Poll,
         token: &Token,
         mut client: HttpClient<Listener::Stream>,
@@ -191,6 +228,7 @@ impl<Listener: MioListener> MetricServer<Listener> {
                     Ok(0) => return Self::close(poll, client),
                     Ok(n) => {
                         *current_position += n;
+                        self.stats.bytes_received += n;
                     }
                     Err(e) if e.kind() == ErrorKind::WouldBlock => {}
                     Err(_e) => return Self::close(poll, client),
@@ -221,13 +259,17 @@ impl<Listener: MioListener> MetricServer<Listener> {
                         _ => Cow::Borrowed(HTTP_404_RESPONSE.as_bytes()),
                     },
                 };
+                self.stats.requests_served += 1;
                 Self::respond(poll, token, client, response)
             }
             MetricRequestStatus::WritingResponse(response, written) => {
                 while *written < response.len() {
                     match client.stream.write(&response[*written..]) {
                         Ok(0) => return Self::close(poll, client),
-                        Ok(n) => *written += n,
+                        Ok(n) => {
+                            *written += n;
+                            self.stats.bytes_sent += n;
+                        }
                         Err(e) if e.kind() == ErrorKind::WouldBlock => return Some(client),
                         Err(_e) => return Self::close(poll, client),
                     }
@@ -330,7 +372,7 @@ mod tests {
         }
 
         let mut poll = Poll::new().unwrap();
-        let server = MetricServer::new(&poll, MockListener, Token(0), 1..2).unwrap();
+        let mut server = MetricServer::new(&poll, MockListener, Token(0), 1..2).unwrap();
 
         let body = "hello world, this is the full metrics response body".to_string();
         let written = Rc::new(RefCell::new(Vec::new()));

@@ -27,7 +27,7 @@ mod signals;
 use signals::SignalHandler;
 
 #[cfg(feature = "metrics")]
-use endlessh::metrics::MetricServer;
+use endlessh::metrics::{MetricServer, MetricsStats};
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum ListenerAddress {
@@ -159,9 +159,24 @@ fn next_token(counter: &mut usize) -> Token {
 struct MetricsSnapshot<'a> {
     uptime: Duration,
     ssh: &'a EndlesshStats,
+    #[cfg(feature = "metrics")]
+    metrics: MetricsStats,
 }
 
-#[cfg(any(feature = "metrics", unix))]
+#[cfg(feature = "metrics")]
+impl std::fmt::Display for MetricsSnapshot<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "endlessh_uptime_seconds: {}\n{}{}",
+            self.uptime.as_secs(),
+            self.ssh,
+            self.metrics
+        )
+    }
+}
+
+#[cfg(all(not(feature = "metrics"), unix))]
 impl std::fmt::Display for MetricsSnapshot<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "endlessh_uptime_seconds: {}\n{}", self.uptime.as_secs(), self.ssh)
@@ -202,6 +217,7 @@ fn event_loop(
                             .as_mut()
                             .map(|s| s.stats())
                             .unwrap_or(&disabled_ssh_stats),
+                        metrics: m.stats(),
                     };
                     m.try_handle_event(event, &mut poll, &snapshot)
                 }) => {}
@@ -213,6 +229,8 @@ fn event_loop(
                             .as_mut()
                             .map(|s| s.stats())
                             .unwrap_or(&disabled_ssh_stats),
+                        #[cfg(feature = "metrics")]
+                        metrics: metric_server.as_mut().map(|m| m.stats()).unwrap_or_default(),
                     };
                     signal_handler.try_handle_event(event, &snapshot)
                 } =>
