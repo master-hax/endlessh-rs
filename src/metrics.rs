@@ -24,7 +24,7 @@ const HTTP_431_RESPONSE: &str =
 type HttpRequestBuffer = [u8; METRIC_HTTP_REQUEST_MAX_SIZE];
 
 enum MetricRequestStatus {
-    ReadingRequest(HttpRequestBuffer, usize),
+    ReadingRequest(usize), // current read position
     WritingResponse(Cow<'static, [u8]>, usize),
 }
 
@@ -80,8 +80,11 @@ pub struct MetricServer<Listener: MioListener> {
     listener: Listener,
     listener_token: Token,
     listener_accept_available: bool,
+    client_token_start: usize,
     available_connections: VecDeque<Token>,
     current_connections: HashMap<Token, HttpClient<Listener::Stream>>,
+    // preallocated, indexed by (token - client_token_start) - avoids a per-connection allocation
+    request_buffers: Vec<HttpRequestBuffer>,
     stats: MetricsStats,
 }
 
@@ -95,6 +98,7 @@ impl<Listener: MioListener> MetricServer<Listener> {
     ) -> std::io::Result<Self> {
         poll.registry()
             .register(&mut listener, listener_token, Interest::READABLE)?;
+        let client_token_start = client_token_range.start;
         let available_connections: VecDeque<Token> =
             client_token_range.into_iter().map(Token).collect();
         let num_available = available_connections.len();
@@ -102,8 +106,10 @@ impl<Listener: MioListener> MetricServer<Listener> {
             listener,
             listener_token,
             listener_accept_available: false,
+            client_token_start,
             available_connections,
             current_connections: HashMap::with_capacity(num_available),
+            request_buffers: vec![[0_u8; METRIC_HTTP_REQUEST_MAX_SIZE]; num_available],
             stats: MetricsStats::default(),
         })
     }
@@ -163,10 +169,7 @@ impl<Listener: MioListener> MetricServer<Listener> {
                     }
                     let new_client = HttpClient {
                         stream,
-                        connection_status: MetricRequestStatus::ReadingRequest(
-                            [0_u8; METRIC_HTTP_REQUEST_MAX_SIZE],
-                            0,
-                        ),
+                        connection_status: MetricRequestStatus::ReadingRequest(0),
                     };
 
                     self.current_connections.insert(token, new_client);
@@ -222,7 +225,8 @@ impl<Listener: MioListener> MetricServer<Listener> {
         http_response_body: &impl ToString,
     ) -> Option<HttpClient<Listener::Stream>> {
         match &mut client.connection_status {
-            MetricRequestStatus::ReadingRequest(request_buffer, current_position) => {
+            MetricRequestStatus::ReadingRequest(current_position) => {
+                let request_buffer = &mut self.request_buffers[token.0 - self.client_token_start];
                 // bounded read - can't overflow `request_buffer`, unlike `std::io::copy`
                 match client.stream.read(&mut request_buffer[*current_position..]) {
                     Ok(0) => return Self::close(poll, client),
