@@ -16,7 +16,7 @@ pub mod metrics;
 
 const SSH_LINE_BUFFER_SIZE: usize = 256;
 
-pub struct LogTimestamp(jiff::Timestamp);
+struct LogTimestamp(jiff::Timestamp);
 
 impl Display for LogTimestamp {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -24,7 +24,7 @@ impl Display for LogTimestamp {
     }
 }
 
-pub fn log_timestamp() -> LogTimestamp {
+fn log_timestamp() -> LogTimestamp {
     let since_epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
