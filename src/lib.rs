@@ -227,7 +227,13 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
         assert!(*now >= self.stats.last_known_time, "time went backwards!");
         self.stats.last_known_time = *now;
         let mut generated_line = false;
-        while let Some(connection) = self.connections.pop_front() {
+        // visit at most one connection per queued slot, so re-queued/new connections can't loop forever
+        let mut remaining = self.connections.len();
+        while remaining > 0 {
+            remaining -= 1;
+            let Some(connection) = self.connections.pop_front() else {
+                break;
+            };
             let send_or_wait: Option<Duration> = match connection.last_send_time {
                 None => {
                     // connection has never received a line - send immediately
@@ -261,7 +267,13 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
                 }
             }
         }
-        None
+        if self.connections.is_empty() {
+            // no connections left to wait on
+            None
+        } else {
+            // all queued connections were just sent to - retry after message_delay
+            Some(self.options.message_delay)
+        }
     }
 
     pub fn stats(&mut self) -> &EndlesshStats {
@@ -346,7 +358,8 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
                 Some(connection)
             }
             Err(ref err) if err.kind() == ErrorKind::WouldBlock => {
-                // couldn't send - oh well
+                // avoid busy-loop when all connections are blocked
+                connection.last_send_time = Some(*now);
                 Some(connection)
             }
             Err(_e) => {
@@ -377,5 +390,202 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
                 connection.bytes_sent
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mio::Registry;
+
+    #[derive(Clone)]
+    struct BlockedStream {
+        write_attempts: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl std::io::Read for BlockedStream {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for BlockedStream {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            self.write_attempts.set(self.write_attempts.get() + 1);
+            Err(std::io::Error::from(ErrorKind::WouldBlock))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl event::Source for BlockedStream {
+        fn register(&mut self, _r: &Registry, _t: Token, _i: Interest) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn reregister(&mut self, _r: &Registry, _t: Token, _i: Interest) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn deregister(&mut self, _r: &Registry) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl MioStream for BlockedStream {
+        fn host_description(&self) -> HostDescription {
+            HostDescription::Unknown
+        }
+    }
+
+    struct NoAcceptListener;
+
+    impl event::Source for NoAcceptListener {
+        fn register(&mut self, _r: &Registry, _t: Token, _i: Interest) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn reregister(&mut self, _r: &Registry, _t: Token, _i: Interest) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn deregister(&mut self, _r: &Registry) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl MioListener for NoAcceptListener {
+        type Stream = BlockedStream;
+        fn accept_stream(&self) -> std::io::Result<BlockedStream> {
+            Err(std::io::Error::from(ErrorKind::WouldBlock))
+        }
+    }
+
+    // once a connection's write returns WouldBlock, it must not be retried again until
+    // message_delay elapses - retrying on every wakeup while blocked is the busy loop
+    #[test]
+    fn blocked_write_is_not_retried_before_message_delay() {
+        let poll = Poll::new().unwrap();
+        let message_delay = Duration::from_secs(10);
+        let mut server = EndlesshServer::new(
+            EndlesshOptions { message_delay, ..Default::default() },
+            NoAcceptListener,
+            Token(0),
+            &poll,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+
+        let write_attempts = std::rc::Rc::new(std::cell::Cell::new(0));
+        let now = Instant::now();
+        for _ in 0..5 {
+            server.connections.push_back(EndlesshConnection {
+                stream: BlockedStream { write_attempts: write_attempts.clone() },
+                connected_time: now,
+                last_send_time: None,
+                bytes_sent: 0,
+            });
+        }
+
+        // first wakeup attempts to send to every connection, all of which block
+        server.handle_wakeup(&now);
+        assert_eq!(write_attempts.get(), 5);
+
+        // a wakeup before message_delay has elapsed must not retry any blocked write
+        server.handle_wakeup(&(now + message_delay - Duration::from_millis(1)));
+        assert_eq!(write_attempts.get(), 5);
+
+        // once message_delay has elapsed, the blocked connections are retried
+        server.handle_wakeup(&(now + message_delay + Duration::from_millis(1)));
+        assert_eq!(write_attempts.get(), 10);
+    }
+
+    struct HardErrorStream;
+
+    impl std::io::Read for HardErrorStream {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for HardErrorStream {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("connection reset"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl event::Source for HardErrorStream {
+        fn register(&mut self, _r: &Registry, _t: Token, _i: Interest) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn reregister(&mut self, _r: &Registry, _t: Token, _i: Interest) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn deregister(&mut self, _r: &Registry) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl MioStream for HardErrorStream {
+        fn host_description(&self) -> HostDescription {
+            HostDescription::Unknown
+        }
+    }
+
+    // a listener with an endless accept backlog, so a dropped connection is always
+    // immediately replaced with a fresh, ready-to-send one
+    struct InfiniteAcceptListener;
+
+    impl event::Source for InfiniteAcceptListener {
+        fn register(&mut self, _r: &Registry, _t: Token, _i: Interest) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn reregister(&mut self, _r: &Registry, _t: Token, _i: Interest) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn deregister(&mut self, _r: &Registry) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl MioListener for InfiniteAcceptListener {
+        type Stream = HardErrorStream;
+        fn accept_stream(&self) -> std::io::Result<HardErrorStream> {
+            Ok(HardErrorStream)
+        }
+    }
+
+    // a connection that keeps getting dropped and replaced must not be revisited
+    // within the same wakeup - only connections queued at the start may be visited
+    #[test]
+    fn dropped_connections_replaced_mid_wakeup_are_not_revisited() {
+        let poll = Poll::new().unwrap();
+        let max_clients = 50;
+        let mut server = EndlesshServer::new(
+            EndlesshOptions { max_clients, ..Default::default() },
+            InfiniteAcceptListener,
+            Token(0),
+            &poll,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        server.listener_accept_available = true;
+
+        let now = Instant::now();
+        for _ in 0..5 {
+            server.connections.push_back(EndlesshConnection {
+                stream: HardErrorStream,
+                connected_time: now,
+                last_send_time: None,
+                bytes_sent: 0,
+            });
+        }
+
+        server.handle_wakeup(&now);
+
+        // only the 5 connections queued at the start of the wakeup were visited and
+        // dropped, even though each drop was immediately backfilled from the backlog
+        assert_eq!(server.stats.connections_closed, 5);
+        assert_eq!(server.connections.len(), max_clients);
     }
 }
