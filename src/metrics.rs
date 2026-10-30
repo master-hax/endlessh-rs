@@ -96,7 +96,7 @@ impl<Listener: MioListener> MetricServer<Listener> {
         poll.registry()
             .register(&mut listener, listener_token, Interest::READABLE)?;
         let available_connections: VecDeque<Token> =
-            client_token_range.into_iter().map(|t| Token(t)).collect();
+            client_token_range.into_iter().map(Token).collect();
         let num_available = available_connections.len();
         Ok(MetricServer {
             listener,
@@ -118,7 +118,7 @@ impl<Listener: MioListener> MetricServer<Listener> {
         poll: &mut Poll,
         response: &impl ToString,
     ) -> bool {
-        return if self.listener_token == event.token() {
+        if self.listener_token == event.token() {
             self.listener_accept_available = true;
             self.try_accept_new_connections(poll);
             true
@@ -139,7 +139,7 @@ impl<Listener: MioListener> MetricServer<Listener> {
             true
         } else {
             false
-        };
+        }
     }
 
     fn try_accept_new_connections(&mut self, poll: &mut Poll) {

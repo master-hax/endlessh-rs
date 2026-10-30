@@ -60,14 +60,14 @@ impl std::str::FromStr for ListenerAddress {
 
 impl std::fmt::Display for ListenerAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        match &self {
-            &ListenerAddress::Ip(i) => {
+        match self {
+            ListenerAddress::Ip(i) => {
                 write!(f, "ip:{}", i)
             }
-            &ListenerAddress::Unix(p) => {
+            ListenerAddress::Unix(p) => {
                 write!(f, "unix:{}", p.display())
             }
-            &ListenerAddress::Disabled => {
+            ListenerAddress::Disabled => {
                 write!(f, "disabled")
             }
         }?;

@@ -44,8 +44,8 @@ pub enum NewLine {
 impl NewLine {
     fn get_data(&self) -> &[u8] {
         match self {
-            NewLine::LF => &['\n' as u8],
-            NewLine::CRLF => &['\r' as u8, '\n' as u8],
+            NewLine::LF => b"\n",
+            NewLine::CRLF => b"\r\n",
         }
     }
 }
@@ -187,7 +187,7 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
         }
         let mut line_buffer = [0_u8; SSH_LINE_BUFFER_SIZE];
         line_buffer[options.banner_line_length..options.banner_line_length + newline_len]
-            .copy_from_slice(&options.newline.get_data());
+            .copy_from_slice(options.newline.get_data());
         let connections = VecDeque::with_capacity(options.max_clients);
 
         poll.registry()
@@ -209,13 +209,13 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
     pub fn try_handle_event(&mut self, event: &event::Event, now: &Instant) -> bool {
         assert!(*now >= self.stats.last_known_time, "time went backwards!");
         self.stats.last_known_time = *now;
-        return if self.listener_token == event.token() {
+        if self.listener_token == event.token() {
             self.listener_accept_available = true;
             self.accept_new_connections(now);
             true
         } else {
             false
-        };
+        }
     }
 
     pub fn handle_wakeup(&mut self, now: &Instant) -> Option<Duration> {
