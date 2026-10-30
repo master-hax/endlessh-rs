@@ -107,7 +107,6 @@ impl Default for EndlesshOptions {
 }
 
 pub struct EndlesshStats {
-    pub started_time: Instant,
     pub last_known_time: Instant,
     pub connections_opened: usize,
     pub connections_closed: usize,
@@ -118,10 +117,8 @@ pub struct EndlesshStats {
 
 impl Default for EndlesshStats {
     fn default() -> Self {
-        let now = Instant::now();
         Self {
-            started_time: now,
-            last_known_time: now,
+            last_known_time: Instant::now(),
             trapped_time: Duration::ZERO,
             connections_opened: 0,
             connections_closed: 0,
@@ -136,16 +133,12 @@ impl Display for EndlesshStats {
         write!(
             f,
             concat!(
-                "endlessh_uptime_seconds: {}\n",
                 "endlessh_ssh_trapped_time_seconds: {}\n",
                 "endlessh_ssh_connections_opened: {}\n",
                 "endlessh_ssh_connections_closed: {}\n",
                 "endlessh_ssh_bytes_generated: {}\n",
                 "endlessh_ssh_bytes_sent: {}\n",
             ),
-            self.last_known_time
-                .duration_since(self.started_time)
-                .as_secs(),
             self.trapped_time.as_secs(),
             self.connections_opened,
             self.connections_closed,

@@ -1,9 +1,11 @@
 /* unix signal handling for graceful shutdown (SIGTERM/SIGINT) and stats dumps (SIGUSR1) */
 
+use std::fmt::Display;
+
 use mio::{event, Interest, Poll, Token};
 use mio_signals::{Signal, Signals};
 
-use endlessh::{EndlesshFatalError, EndlesshStats};
+use endlessh::EndlesshFatalError;
 
 pub struct SignalHandler {
     token: Token,
@@ -27,7 +29,7 @@ impl SignalHandler {
         self.should_terminate
     }
 
-    pub fn try_handle_event(&mut self, event: &event::Event, stats: &EndlesshStats) -> bool {
+    pub fn try_handle_event(&mut self, event: &event::Event, stats: &impl Display) -> bool {
         if event.token() != self.token {
             return false;
         }

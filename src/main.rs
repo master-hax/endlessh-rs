@@ -15,6 +15,9 @@ use std::time::{Duration, Instant};
 
 use endlessh::{AnyListener, EndlesshFatalError, EndlesshOptions, EndlesshServer, NewLine, Verbosity};
 
+#[cfg(any(feature = "metrics", unix))]
+use endlessh::EndlesshStats;
+
 #[cfg(unix)]
 use {mio::net::UnixListener, std::fs::remove_file};
 
@@ -101,7 +104,7 @@ struct Args {
     #[arg(
         long,
         default_value_t=ListenerAddress::Ip(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 2222))),
-        help = "address to accept ssh connections on, in the form \"ip:<socketaddr>\" or \"unix:<socketpath>\""
+        help = "address to accept ssh connections on, in the form \"disabled\", \"ip:<socketaddr>\", or \"unix:<socketpath>\""
     )]
     ssh_listen_address: ListenerAddress,
     #[arg(
@@ -151,13 +154,32 @@ fn next_token(counter: &mut usize) -> Token {
     token
 }
 
+// process-level stats combined with ssh stats for the metrics endpoint and signal dumps
+#[cfg(any(feature = "metrics", unix))]
+struct MetricsSnapshot<'a> {
+    uptime: Duration,
+    ssh: &'a EndlesshStats,
+}
+
+#[cfg(any(feature = "metrics", unix))]
+impl std::fmt::Display for MetricsSnapshot<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "endlessh_uptime_seconds: {}\n{}", self.uptime.as_secs(), self.ssh)
+    }
+}
+
 fn event_loop(
     mut poll: Poll,
     mut events: Events,
-    mut endlessh_server: EndlesshServer<AnyListener>,
+    mut endlessh_server: Option<EndlesshServer<AnyListener>>,
     #[cfg(feature = "metrics")] mut metric_server: Option<MetricServer<AnyListener>>,
     #[cfg(unix)] mut signal_handler: SignalHandler,
+    #[cfg(any(feature = "metrics", unix))] start_time: Instant,
 ) {
+    // reported as ssh stats when the ssh listener is disabled
+    #[cfg(any(feature = "metrics", unix))]
+    let disabled_ssh_stats = EndlesshStats::default();
+
     let mut timeout = None;
     loop {
         if let Err(err) = poll.poll(&mut events, timeout) {
@@ -169,13 +191,32 @@ fn event_loop(
         let loop_time = Instant::now();
         for event in events.iter() {
             match event.token() {
-                _ if endlessh_server.try_handle_event(event, &loop_time) => {}
+                _ if endlessh_server
+                    .as_mut()
+                    .is_some_and(|s| s.try_handle_event(event, &loop_time)) => {}
                 #[cfg(feature = "metrics")]
                 _ if metric_server.as_mut().is_some_and(|m| {
-                    m.try_handle_event(event, &mut poll, endlessh_server.stats())
+                    let snapshot = MetricsSnapshot {
+                        uptime: loop_time.duration_since(start_time),
+                        ssh: endlessh_server
+                            .as_mut()
+                            .map(|s| s.stats())
+                            .unwrap_or(&disabled_ssh_stats),
+                    };
+                    m.try_handle_event(event, &mut poll, &snapshot)
                 }) => {}
                 #[cfg(unix)]
-                _ if signal_handler.try_handle_event(event, endlessh_server.stats()) => {
+                _ if {
+                    let snapshot = MetricsSnapshot {
+                        uptime: loop_time.duration_since(start_time),
+                        ssh: endlessh_server
+                            .as_mut()
+                            .map(|s| s.stats())
+                            .unwrap_or(&disabled_ssh_stats),
+                    };
+                    signal_handler.try_handle_event(event, &snapshot)
+                } =>
+                {
                     if signal_handler.should_terminate() {
                         return;
                     }
@@ -185,11 +226,15 @@ fn event_loop(
                 }
             }
         }
-        timeout = endlessh_server.handle_wakeup(&loop_time);
+        timeout = endlessh_server
+            .as_mut()
+            .and_then(|s| s.handle_wakeup(&loop_time));
     }
 }
 
 fn run(args: &Args) -> Result<(), EndlesshFatalError> {
+    #[cfg(any(feature = "metrics", unix))]
+    let start_time = Instant::now();
     let poll = Poll::new()?;
     let events = Events::with_capacity(128);
 
@@ -211,16 +256,19 @@ fn run(args: &Args) -> Result<(), EndlesshFatalError> {
         newline: NewLine::LF,
     };
 
-    let ssh_listener = args.ssh_listen_address.bind("ssh")?.ok_or_else(|| {
-        EndlesshFatalError::InvalidOptions(Cow::Borrowed("ssh listener cannot be disabled"))
-    })?;
-    let endlessh_server = EndlesshServer::new(
-        ssh_options,
-        ssh_listener,
-        ssh_server_token,
-        &poll,
-        Verbosity::from(args.verbose),
-    )?;
+    let endlessh_server = args
+        .ssh_listen_address
+        .bind("ssh")?
+        .map(|listener| {
+            EndlesshServer::new(
+                ssh_options,
+                listener,
+                ssh_server_token,
+                &poll,
+                Verbosity::from(args.verbose),
+            )
+        })
+        .transpose()?;
 
     #[cfg(feature = "metrics")]
     let metric_server = args
@@ -236,6 +284,19 @@ fn run(args: &Args) -> Result<(), EndlesshFatalError> {
         })
         .transpose()?;
 
+    #[cfg(feature = "metrics")]
+    if endlessh_server.is_none() && metric_server.is_none() {
+        return Err(EndlesshFatalError::InvalidOptions(Cow::Borrowed(
+            "at least one of the ssh or metrics listener must be enabled",
+        )));
+    }
+    #[cfg(not(feature = "metrics"))]
+    if endlessh_server.is_none() {
+        return Err(EndlesshFatalError::InvalidOptions(Cow::Borrowed(
+            "ssh listener cannot be disabled",
+        )));
+    }
+
     event_loop(
         poll,
         events,
@@ -244,6 +305,8 @@ fn run(args: &Args) -> Result<(), EndlesshFatalError> {
         metric_server,
         #[cfg(unix)]
         signal_handler,
+        #[cfg(any(feature = "metrics", unix))]
+        start_time,
     );
     Ok(())
 }
