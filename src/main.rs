@@ -10,19 +10,18 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use mio::net::TcpListener;
-use mio::{event, Events, Interest, Poll, Token};
+use mio::{Events, Poll, Token};
 use std::time::{Duration, Instant};
 
 use endlessh::{AnyListener, EndlesshFatalError, EndlesshOptions, EndlesshServer, NewLine, Verbosity};
 
 #[cfg(unix)]
-use endlessh::EndlesshStats;
-
-#[cfg(unix)]
 use {mio::net::UnixListener, std::fs::remove_file};
 
 #[cfg(unix)]
-use mio_signals::{Signal, Signals};
+mod signals;
+#[cfg(unix)]
+use signals::SignalHandler;
 
 #[cfg(feature = "metrics")]
 use endlessh::metrics::MetricServer;
@@ -144,58 +143,6 @@ struct Args {
         help = "increase logging verbosity (-v logs each connection, -vv for debug)"
     )]
     verbose: u8,
-}
-
-#[cfg(unix)]
-struct SignalHandler {
-    token: Token,
-    signals: Signals,
-    should_terminate: bool,
-}
-
-#[cfg(unix)]
-impl SignalHandler {
-    fn new(poll: &Poll, token: Token) -> Result<Self, EndlesshFatalError> {
-        let mut signals = Signals::new(Signal::Terminate | Signal::Interrupt | Signal::User1)?;
-        poll.registry()
-            .register(&mut signals, token, Interest::READABLE)?;
-        Ok(SignalHandler {
-            token,
-            signals,
-            should_terminate: false,
-        })
-    }
-
-    fn should_terminate(&self) -> bool {
-        self.should_terminate
-    }
-
-    fn try_handle_event(&mut self, event: &event::Event, stats: &EndlesshStats) -> bool {
-        if event.token() != self.token {
-            return false;
-        }
-        loop {
-            match self.signals.receive() {
-                Ok(Some(Signal::Terminate)) => {
-                    eprintln!("endlessh-rs: received SIGTERM, shutting down\n{}", stats);
-                    self.should_terminate = true;
-                    return true;
-                }
-                Ok(Some(Signal::Interrupt)) => {
-                    eprintln!("endlessh-rs: received SIGINT, shutting down\n{}", stats);
-                    self.should_terminate = true;
-                    return true;
-                }
-                Ok(Some(Signal::User1)) => eprintln!("{}", stats),
-                Ok(Some(_)) => {}
-                Ok(None) => return true,
-                Err(e) => {
-                    eprintln!("failed to read pending signal: {}", e);
-                    return true;
-                }
-            }
-        }
-    }
 }
 
 fn next_token(counter: &mut usize) -> Token {
