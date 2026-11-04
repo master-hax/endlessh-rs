@@ -44,7 +44,10 @@ Options:
 | Memory safe language | 🟢 yes (Rust) | 🔴 no (C) | 🟢 yes (Go) |
 | Windows support | 🟢 yes | 🔴 no | 🟢 yes |
 | Unix socket support | 🟢 yes, for ssh and metrics | 🔴 no | 🟡 metrics only, not ssh |
+| Multiple listening ports | 🔴 no, one port | 🔴 no, one port | 🟢 yes, repeatable `-port` |
 | Static binary support | 🟢 yes (musl target) | 🟢 yes (`-static`) | 🟢 yes (`CGO_ENABLED=0`) |
+| Static binary size | 🟡 ~1.0 MB | 🟢 ~78 KB | 🔴 ~11.5 MB |
+| Dynamic binary size | 🟡 ~940 KB | 🟢 ~23 KB | 🔴 ~11.6 MB |
 | Number of OS threads | 🟢 1 | 🟢 1 | 🟡 `GOMAXPROCS` (usually = number of CPUs) |
 | I/O event notification | 🟢 `epoll`/`kqueue`/IOCP | 🟡 `poll()` | 🟢 `epoll`/`kqueue`/IOCP |
 | Connection polling | 🟢 none | 🟡 only those due to send | 🔴 all connections |
