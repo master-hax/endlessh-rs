@@ -37,6 +37,23 @@ Options:
           Print version
 ```
 
+## Comparison with other implementations
+
+|                   | endlessh-rs | [endlessh](https://github.com/skeeto/endlessh) | [endlessh-go](https://github.com/shizunge/endlessh-go) |
+|-------------------|-------------|-------------------------------------------------|------------------------------------------------------|
+| Memory safe language | 🟢 yes (Rust) | 🔴 no (C) | 🟢 yes (Go) |
+| Windows support | 🟢 yes | 🔴 no | 🟢 yes |
+| Unix socket support | 🟢 yes, for ssh and metrics | 🔴 no | 🟡 metrics only, not ssh |
+| Static binary support | 🟢 yes (musl target) | 🟢 yes (`-static`) | 🟢 yes (`CGO_ENABLED=0`) |
+| Number of OS threads | 🟢 1 | 🟢 1 | 🟡 `GOMAXPROCS` (usually = number of CPUs) |
+| I/O event notification | 🟢 `epoll`/`kqueue`/IOCP | 🟡 `poll()` | 🟢 `epoll`/`kqueue`/IOCP |
+| Connection polling | 🟢 none | 🟡 only those due to send | 🔴 all connections |
+| Memory usage | 🟢 minimal | 🟢 minimal | 🔴 unbounded |
+| `SIGUSR1` stats dump | 🟢 yes | 🟢 yes | 🔴 no |
+| fail2ban-compatible logs | 🟢 yes | 🟢 yes | 🟢 yes |
+| OpenMetrics/Prometheus support | 🟢 yes | 🔴 no | 🟢 yes |
+| License | MIT OR Apache-2.0 | Unlicense | GPLv3 |
+
 ## Building
 
 ### Standard release build
@@ -86,4 +103,3 @@ symbol information through `strip = "symbols"` in `Cargo.toml`.
 ## TODO
 
 - [ ] support detailed client metrics
-- [ ] add comparison between implementations
