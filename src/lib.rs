@@ -265,12 +265,13 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
                 }
             }
         }
-        if self.connections.is_empty() {
+        match self.connections.front() {
             // no connections left to wait on
-            None
-        } else {
+            None => None,
+            // front connection is unsent (backfilled mid-pass) - wake up right away
+            Some(c) if c.last_send_time.is_none() => Some(Duration::ZERO),
             // all queued connections were just sent to - retry after message_delay
-            Some(self.options.message_delay)
+            Some(_) => Some(self.options.message_delay),
         }
     }
 
@@ -300,7 +301,9 @@ impl<Listener: MioListener> EndlesshServer<Listener> {
                             self.options.max_clients
                         );
                     }
-                    self.connections.push_back(EndlesshConnection {
+                    // push to the front so this connection is visited next, not stuck
+                    // behind already-queued connections that aren't due for a while
+                    self.connections.push_front(EndlesshConnection {
                         stream,
                         connected_time: *now,
                         last_send_time: None,
@@ -593,5 +596,129 @@ mod tests {
         // dropped, even though each drop was immediately backfilled from the backlog
         assert_eq!(server.stats.connections_closed, 5);
         assert_eq!(server.connections.len(), max_clients);
+    }
+
+    // a stream that is either already closed (write returns Ok(0)) or records how
+    // many times it has been written to - used so the originally-queued connection
+    // and its fresh replacement can share one EndlesshServer's Stream type
+    enum TestStream {
+        Closed,
+        Recording(std::rc::Rc<std::cell::Cell<usize>>),
+    }
+
+    impl std::io::Read for TestStream {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for TestStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            match self {
+                TestStream::Closed => Ok(0),
+                TestStream::Recording(write_count) => {
+                    write_count.set(write_count.get() + 1);
+                    Ok(buf.len())
+                }
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl event::Source for TestStream {
+        fn register(&mut self, _r: &Registry, _t: Token, _i: Interest) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn reregister(&mut self, _r: &Registry, _t: Token, _i: Interest) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn deregister(&mut self, _r: &Registry) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl MioStream for TestStream {
+        fn host_description(&self) -> HostDescription {
+            HostDescription::Unknown
+        }
+    }
+
+    // a listener that hands out exactly one fresh connection, then blocks
+    struct OneShotListener {
+        stream: std::cell::RefCell<Option<TestStream>>,
+    }
+
+    impl event::Source for OneShotListener {
+        fn register(&mut self, _r: &Registry, _t: Token, _i: Interest) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn reregister(&mut self, _r: &Registry, _t: Token, _i: Interest) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn deregister(&mut self, _r: &Registry) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl MioListener for OneShotListener {
+        type Stream = TestStream;
+        fn accept_stream(&self) -> std::io::Result<TestStream> {
+            self.stream
+                .borrow_mut()
+                .take()
+                .ok_or_else(|| std::io::Error::from(ErrorKind::WouldBlock))
+        }
+    }
+
+    // when a connection closes and is immediately backfilled from the listener during
+    // the same wakeup, the fresh replacement must not have to wait a full message_delay
+    // for its first banner line - it was never sent to, unlike the connections that
+    // triggered the original busy-loop fix
+    #[test]
+    fn backfilled_connection_is_sent_without_waiting_full_message_delay() {
+        let poll = Poll::new().unwrap();
+        let message_delay = Duration::from_secs(10);
+        let write_count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let listener = OneShotListener {
+            stream: std::cell::RefCell::new(Some(TestStream::Recording(write_count.clone()))),
+        };
+        let mut server = EndlesshServer::new(
+            EndlesshOptions {
+                message_delay,
+                ..Default::default()
+            },
+            listener,
+            Token(0),
+            &poll,
+            Verbosity::Quiet,
+        )
+        .unwrap();
+        server.listener_accept_available = true;
+
+        let now = Instant::now();
+        server.connections.push_back(EndlesshConnection {
+            stream: TestStream::Closed,
+            connected_time: now,
+            last_send_time: None,
+            bytes_sent: 0,
+        });
+
+        // the only queued connection closes immediately and is backfilled by a fresh
+        // connection from the listener
+        let next_wakeup = server.handle_wakeup(&now);
+        assert_eq!(server.connections.len(), 1);
+        assert_eq!(write_count.get(), 0);
+        assert!(
+            next_wakeup.is_some_and(|d| d < message_delay),
+            "backfilled connection must be revisited well before message_delay, got {:?}",
+            next_wakeup
+        );
+
+        // the next scheduled wakeup must deliver the backfilled connection's first
+        // banner line, rather than waiting out the full message_delay
+        server.handle_wakeup(&(now + next_wakeup.unwrap()));
+        assert_eq!(write_count.get(), 1);
     }
 }
